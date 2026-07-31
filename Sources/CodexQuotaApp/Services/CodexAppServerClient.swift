@@ -3,19 +3,20 @@ import Foundation
 private final class ProcessOutputBuffer: @unchecked Sendable {
   private let lock = NSLock()
   private var data = Data()
-  private var didSignalResponse = false
+  private var signaledResponseIDs = Set<Int>()
 
-  func append(_ chunk: Data, waitingFor responseID: Int) -> Bool {
+  func append(_ chunk: Data, watching responseIDs: [Int]) -> [Int] {
     lock.lock()
     defer { lock.unlock() }
 
     data.append(chunk)
-    guard !didSignalResponse, containsResponse(id: responseID) else {
-      return false
+    var newlyAvailable: [Int] = []
+    for responseID in responseIDs
+    where !signaledResponseIDs.contains(responseID) && containsResponse(id: responseID) {
+      signaledResponseIDs.insert(responseID)
+      newlyAvailable.append(responseID)
     }
-
-    didSignalResponse = true
-    return true
+    return newlyAvailable
   }
 
   func snapshot() -> Data {
@@ -73,6 +74,7 @@ enum CodexQuotaError: LocalizedError, Sendable {
 }
 
 actor CodexAppServerClient {
+  private static let initializeRequestID = 1
   private static let accountRequestID = 2
   private static let rateLimitsRequestID = 3
   private static let requestTimeout: TimeInterval = 15
@@ -97,13 +99,21 @@ actor CodexAppServerClient {
     process.standardError = errorPipe
 
     let outputBuffer = ProcessOutputBuffer()
-    let responseReady = DispatchSemaphore(value: 0)
+    let initializeReady = DispatchSemaphore(value: 0)
+    let rateLimitsReady = DispatchSemaphore(value: 0)
     outputPipe.fileHandleForReading.readabilityHandler = { handle in
       let chunk = handle.availableData
       guard !chunk.isEmpty else { return }
 
-      if outputBuffer.append(chunk, waitingFor: rateLimitsRequestID) {
-        responseReady.signal()
+      let availableIDs = outputBuffer.append(
+        chunk,
+        watching: [initializeRequestID, rateLimitsRequestID]
+      )
+      if availableIDs.contains(initializeRequestID) {
+        initializeReady.signal()
+      }
+      if availableIDs.contains(rateLimitsRequestID) {
+        rateLimitsReady.signal()
       }
     }
 
@@ -113,8 +123,51 @@ actor CodexAppServerClient {
       throw CodexQuotaError.launchFailed(error.localizedDescription)
     }
 
+    do {
+      let initializeRequest = """
+        {"method":"initialize","id":\(initializeRequestID),"params":{"clientInfo":{"name":"codex_quota_macos","title":"Codex Quota","version":"1.0.0"}}}
+
+        """
+      try inputPipe.fileHandleForWriting.write(contentsOf: Data(initializeRequest.utf8))
+    } catch {
+      if process.isRunning {
+        process.terminate()
+      }
+      throw CodexQuotaError.launchFailed(error.localizedDescription)
+    }
+
+    let initializeWaitResult = initializeReady.wait(timeout: .now() + requestTimeout)
+    if initializeWaitResult == .timedOut {
+      outputPipe.fileHandleForReading.readabilityHandler = nil
+      try? inputPipe.fileHandleForWriting.close()
+      if process.isRunning {
+        process.terminate()
+        process.waitUntilExit()
+      }
+      throw CodexQuotaError.requestTimedOut
+    }
+
+    let initializeResponses = decodeResponses(from: outputBuffer.snapshot())
+    if let serverError = responseError(for: initializeRequestID, in: initializeResponses) {
+      outputPipe.fileHandleForReading.readabilityHandler = nil
+      try? inputPipe.fileHandleForWriting.close()
+      if process.isRunning {
+        process.terminate()
+        process.waitUntilExit()
+      }
+      throw CodexQuotaError.serverError("初始化失败：\(serverError)")
+    }
+    guard hasSuccessfulResponse(for: initializeRequestID, in: initializeResponses) else {
+      outputPipe.fileHandleForReading.readabilityHandler = nil
+      try? inputPipe.fileHandleForWriting.close()
+      if process.isRunning {
+        process.terminate()
+        process.waitUntilExit()
+      }
+      throw CodexQuotaError.invalidResponse
+    }
+
     let request = """
-      {"method":"initialize","id":1,"params":{"clientInfo":{"name":"codex_quota_macos","title":"Codex Quota","version":"1.0.0"}}}
       {"method":"initialized","params":{}}
       {"method":"account/read","id":\(accountRequestID),"params":{"refreshToken":false}}
       {"method":"account/rateLimits/read","id":\(rateLimitsRequestID)}
@@ -124,13 +177,14 @@ actor CodexAppServerClient {
     do {
       try inputPipe.fileHandleForWriting.write(contentsOf: Data(request.utf8))
     } catch {
+      outputPipe.fileHandleForReading.readabilityHandler = nil
       if process.isRunning {
         process.terminate()
       }
       throw CodexQuotaError.launchFailed(error.localizedDescription)
     }
 
-    let waitResult = responseReady.wait(timeout: .now() + requestTimeout)
+    let waitResult = rateLimitsReady.wait(timeout: .now() + requestTimeout)
     outputPipe.fileHandleForReading.readabilityHandler = nil
     try? inputPipe.fileHandleForWriting.close()
 
@@ -278,6 +332,15 @@ actor CodexAppServerClient {
       return nil
     }
     return nonEmptyString(error["message"]) ?? "未知错误"
+  }
+
+  private static func hasSuccessfulResponse(
+    for requestID: Int,
+    in responses: [[String: Any]]
+  ) -> Bool {
+    responses.contains { response in
+      integer(response["id"]) == requestID && response["result"] != nil
+    }
   }
 
   private static func locateCodexExecutable() throws -> URL {

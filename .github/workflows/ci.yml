@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build application bundle
+        run: ./scripts/build-app.sh
+
+      - name: Verify application bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "dist/Codex Quota.app/Contents/MacOS/CodexQuota"
+          test -f "dist/Codex Quota.zip"
+          lipo "dist/Codex Quota.app/Contents/MacOS/CodexQuota" -verify_arch arm64
+          codesign --verify --deep --strict "dist/Codex Quota.app"
+
+      - name: Upload macOS build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-quota-macos-arm64
+          path: dist/Codex Quota.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run core tests
+        run: dotnet test Windows/CodexQuota.Core.Tests/CodexQuota.Core.Tests.csproj --configuration Release
+
+      - name: Publish self-contained single-file application
+        shell: pwsh
+        run: >-
+          dotnet publish Windows/CodexQuota.Windows/CodexQuota.Windows.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          --output artifacts/windows
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -p:ContinuousIntegrationBuild=true
+          -p:Deterministic=true
+
+      - name: Verify single-file executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem artifacts/windows -File)
+          if ($files.Count -ne 1 -or $files[0].Name -ne 'CodexQuota.exe') {
+            throw "Expected only CodexQuota.exe, found: $($files.Name -join ', ')"
+          }
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-quota-windows-x64
+          path: artifacts/windows/CodexQuota.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -18,3 +18,7 @@ xcuserdata/
 *.pem
 .idea/
 .vscode/
+**/bin/
+**/obj/
+artifacts/
+release-assets/
