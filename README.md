@@ -16,6 +16,16 @@
 - 不修改 `/Applications/ChatGPT.app`，不破坏 OpenAI 代码签名和自动更新
 - 不需要辅助功能或屏幕录制权限
 
+## 使用截图
+
+### 用户名旁的剩余额度
+
+<img src="docs/images/quota-badge.png" alt="Codex 左下角用户名旁的剩余额度徽标和进度条" width="660">
+
+### 点击徽标自定义颜色
+
+<img src="docs/images/color-picker.png" alt="点击额度徽标后打开 macOS 原生取色器" width="250">
+
 ## 系统要求
 
 - macOS 14 或更高版本
