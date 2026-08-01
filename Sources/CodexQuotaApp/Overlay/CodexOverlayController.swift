@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import QuartzCore
 import SwiftUI
 
 struct CodexOverlayLayout {
@@ -21,8 +22,10 @@ final class CodexOverlayController: NSObject, NSWindowDelegate {
 
   private let panel: NSPanel
   private let appearanceStore: BadgeAppearanceStore
+  private let windowLocator = CodexWindowLocator()
   private var applicationToReactivate: NSRunningApplication?
-  private var trackingTimer: Timer?
+  private var trackingDisplayLink: CADisplayLink?
+  private var workspaceActivationObserver: NSObjectProtocol?
 
   init(store: CodexQuotaStore, appearanceStore: BadgeAppearanceStore) {
     self.appearanceStore = appearanceStore
@@ -62,23 +65,36 @@ final class CodexOverlayController: NSObject, NSWindowDelegate {
   }
 
   func start() {
-    guard trackingTimer == nil else { return }
+    guard trackingDisplayLink == nil else { return }
 
     updatePlacement()
-    let timer = Timer(
-      timeInterval: 0.2,
+    let displayLink = panel.displayLink(
       target: self,
-      selector: #selector(trackingTimerFired),
-      userInfo: nil,
-      repeats: true
+      selector: #selector(displayLinkFired(_:))
     )
-    RunLoop.main.add(timer, forMode: .common)
-    trackingTimer = timer
+    displayLink.add(to: .main, forMode: .common)
+    displayLink.isPaused = !isCodexFrontmost
+    trackingDisplayLink = displayLink
+
+    workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didActivateApplicationNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated {
+        self?.frontmostApplicationChanged()
+      }
+    }
   }
 
   func stop() {
-    trackingTimer?.invalidate()
-    trackingTimer = nil
+    trackingDisplayLink?.invalidate()
+    trackingDisplayLink = nil
+    if let workspaceActivationObserver {
+      NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
+      self.workspaceActivationObserver = nil
+    }
+    windowLocator.reset()
     panel.orderOut(nil)
   }
 
@@ -113,13 +129,29 @@ final class CodexOverlayController: NSObject, NSWindowDelegate {
     applicationToReactivate = nil
   }
 
-  @objc private func trackingTimerFired() {
+  @objc private func displayLinkFired(_ displayLink: CADisplayLink) {
     updatePlacement()
   }
 
+  private func frontmostApplicationChanged() {
+    let isCodexActive = isCodexFrontmost
+    trackingDisplayLink?.isPaused = !isCodexActive
+
+    if isCodexActive {
+      windowLocator.reset()
+      updatePlacement()
+    } else {
+      panel.orderOut(nil)
+    }
+  }
+
   private func updatePlacement() {
-    guard isCodexFrontmost,
-      let codexWindowFrame = frontmostCodexWindowFrame()
+    guard
+      let application = frontmostCodexApplication,
+      let quartzFrame = windowLocator.windowFrame(
+        processIdentifier: application.processIdentifier,
+        timestamp: ProcessInfo.processInfo.systemUptime
+      )
     else {
       if panel.isVisible {
         panel.orderOut(nil)
@@ -127,10 +159,11 @@ final class CodexOverlayController: NSObject, NSWindowDelegate {
       return
     }
 
-    let targetFrame = CodexOverlayLayout.badgeFrame(for: codexWindowFrame)
+    let codexWindowFrame = appKitFrame(fromQuartzFrame: quartzFrame)
+    let targetOrigin = CodexOverlayLayout.badgeFrame(for: codexWindowFrame).origin
 
-    if !panel.frame.approximatelyEquals(targetFrame) {
-      panel.setFrame(targetFrame, display: true)
+    if !panel.frame.origin.approximatelyEquals(targetOrigin) {
+      panel.setFrameOrigin(targetOrigin)
     }
 
     if !panel.isVisible {
@@ -139,55 +172,19 @@ final class CodexOverlayController: NSObject, NSWindowDelegate {
   }
 
   private var isCodexFrontmost: Bool {
-    NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.codexBundleIdentifier
+    frontmostCodexApplication != nil
   }
 
-  private func frontmostCodexWindowFrame() -> CGRect? {
+  private var frontmostCodexApplication: NSRunningApplication? {
     guard
-      let application = NSRunningApplication.runningApplications(
-        withBundleIdentifier: Self.codexBundleIdentifier
-      ).first(where: { !$0.isTerminated })
+      let application = NSWorkspace.shared.frontmostApplication,
+      application.bundleIdentifier == Self.codexBundleIdentifier,
+      !application.isTerminated
     else {
       return nil
     }
 
-    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-    guard
-      let windowRows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
-        as? [[String: Any]]
-    else {
-      return nil
-    }
-
-    for row in windowRows {
-      guard
-        (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
-          == application.processIdentifier,
-        (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
-        let quartzFrame = quartzWindowFrame(from: row),
-        quartzFrame.width >= 700,
-        quartzFrame.height >= 500
-      else {
-        continue
-      }
-
-      return appKitFrame(fromQuartzFrame: quartzFrame)
-    }
-
-    return nil
-  }
-
-  private func quartzWindowFrame(from row: [String: Any]) -> CGRect? {
-    guard let bounds = row[kCGWindowBounds as String] as? [String: Any],
-      let x = number(bounds["X"]),
-      let y = number(bounds["Y"]),
-      let width = number(bounds["Width"]),
-      let height = number(bounds["Height"])
-    else {
-      return nil
-    }
-
-    return CGRect(x: x, y: y, width: width, height: height)
+    return application
   }
 
   private func appKitFrame(fromQuartzFrame quartzFrame: CGRect) -> CGRect {
@@ -221,23 +218,10 @@ final class CodexOverlayController: NSObject, NSWindowDelegate {
       height: quartzFrame.height
     )
   }
-
-  private func number(_ value: Any?) -> CGFloat? {
-    if let number = value as? NSNumber {
-      return CGFloat(number.doubleValue)
-    }
-    if let number = value as? Double {
-      return CGFloat(number)
-    }
-    return nil
-  }
 }
 
-extension CGRect {
-  fileprivate func approximatelyEquals(_ other: CGRect, tolerance: CGFloat = 0.5) -> Bool {
-    abs(minX - other.minX) <= tolerance
-      && abs(minY - other.minY) <= tolerance
-      && abs(width - other.width) <= tolerance
-      && abs(height - other.height) <= tolerance
+extension CGPoint {
+  fileprivate func approximatelyEquals(_ other: CGPoint, tolerance: CGFloat = 0.5) -> Bool {
+    abs(x - other.x) <= tolerance && abs(y - other.y) <= tolerance
   }
 }
