@@ -22,19 +22,27 @@ public sealed class CodexAppServerClientTests
             await File.WriteAllTextAsync(scriptPath, FakeCodexScript);
             await File.WriteAllTextAsync(
                 oldCommandPath,
-                "@echo off\r\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0fake-codex.ps1\" incompatible %*\r\n");
+                FakeCommand("incompatible"));
             await File.WriteAllTextAsync(
                 compatibleCommandPath,
-                "@echo off\r\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0fake-codex.ps1\" compatible %*\r\n");
+                FakeCommand("compatible"));
 
             var client = new CodexAppServerClient(new[] { oldCommandPath, compatibleCommandPath });
-            var snapshot = await client.FetchSnapshotAsync();
+            try
+            {
+                var snapshot = await client.FetchSnapshotAsync();
 
-            Assert.Equal(42, snapshot.RemainingPercent);
-            Assert.Equal("Codex Plus", snapshot.PlanName);
-            Assert.Contains("codex-cli test-compatible", client.LastDiagnostic);
-            Assert.Contains("额度读取成功", client.LastDiagnostic);
-            Assert.Contains("额度接口不兼容", client.LastDiagnostic);
+                Assert.Equal(42, snapshot.RemainingPercent);
+                Assert.Equal("Codex Plus", snapshot.PlanName);
+                Assert.Contains("codex-cli test-compatible", client.LastDiagnostic);
+                Assert.Contains("额度读取成功", client.LastDiagnostic);
+                Assert.Contains("额度接口不兼容", client.LastDiagnostic);
+            }
+            catch (Exception exception)
+            {
+                throw new Xunit.Sdk.XunitException(
+                    $"{exception}\n\nClient diagnostic:\n{client.LastDiagnostic}");
+            }
         }
         finally
         {
@@ -42,18 +50,15 @@ public sealed class CodexAppServerClientTests
         }
     }
 
+    private static string FakeCommand(string flavor) =>
+        $"@echo off\r\n" +
+        $"if /I \"%~1\"==\"--version\" (\r\n  echo codex-cli test-{flavor}\r\n  exit /b 0\r\n)\r\n" +
+        "if /I not \"%~1\"==\"app-server\" exit /b 2\r\n" +
+        $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0fake-codex.ps1\" {flavor}\r\n";
+
     private const string FakeCodexScript = """
-        param([string]$Flavor, [string]$Mode)
+        param([string]$Flavor)
         $ErrorActionPreference = 'Stop'
-
-        if ($Mode -eq '--version') {
-          [Console]::Out.WriteLine("codex-cli test-$Flavor")
-          exit 0
-        }
-
-        if ($Mode -ne 'app-server') {
-          exit 2
-        }
 
         while (($line = [Console]::In.ReadLine()) -ne $null) {
           $request = $line | ConvertFrom-Json
