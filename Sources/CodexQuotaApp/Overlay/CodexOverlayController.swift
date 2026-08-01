@@ -68,7 +68,14 @@ final class CodexOverlayController: NSObject, NSWindowDelegate {
     guard trackingDisplayLink == nil else { return }
 
     updatePlacement()
-    let displayLink = panel.displayLink(
+    guard let trackingScreen = NSScreen.main ?? NSScreen.screens.first else {
+      return
+    }
+
+    // A display link owned by the panel stops firing when that tiny panel is
+    // temporarily off-screen. Bind tracking to the physical display so the
+    // overlay can always recover its position on the next frame.
+    let displayLink = trackingScreen.displayLink(
       target: self,
       selector: #selector(displayLinkFired(_:))
     )
