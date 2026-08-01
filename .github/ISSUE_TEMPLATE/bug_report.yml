@@ -1,0 +1,96 @@
+name: Bug report
+description: Report an issue with the macOS or Windows overlay
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Codex Quota. Please search existing issues first.
+
+        **Privacy:** never paste a login token, API key, or the contents of `auth.json`.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS — Apple Silicon
+        - macOS — Intel
+        - Windows — x64
+        - Windows — ARM64
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: Operating system version
+      placeholder: "Example: macOS 15.6 or Windows 11 24H2"
+    validations:
+      required: true
+
+  - type: input
+    id: quota-version
+    attributes:
+      label: Codex Quota version
+      placeholder: "Example: v1.0.1"
+    validations:
+      required: true
+
+  - type: input
+    id: codex-version
+    attributes:
+      label: Codex desktop app version
+      placeholder: "Find it in Codex → About"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start Codex Quota
+        2. Open Codex with the sidebar expanded
+        3. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: On Windows, use the tray menu's “Copy diagnostics” command. Remove anything you consider private.
+      render: text
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or additional context
+      description: Drag images here. Crop or blur private account and conversation information first.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Safety checklist
+      options:
+        - label: I downloaded Codex Quota from this repository or built it from source.
+          required: true
+        - label: I did not include a login token, API key, or `auth.json` contents.
+          required: true

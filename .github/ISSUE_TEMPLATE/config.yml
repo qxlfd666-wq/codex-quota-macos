@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation and troubleshooting
+    url: https://github.com/qxlfd666-wq/codex-quota#requirements
+    about: Check requirements, platform instructions, and common quota-reading fixes first.
+  - name: Security vulnerability
+    url: https://github.com/qxlfd666-wq/codex-quota/security/advisories/new
+    about: Privately report a security issue instead of opening a public issue.

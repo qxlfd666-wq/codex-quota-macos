@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+
+PackageIdentifier: qxlfd666-wq.CodexQuota
+PackageVersion: '1.0.1'
+PackageLocale: en-US
+Publisher: qxlfd666-wq
+PublisherUrl: https://github.com/qxlfd666-wq
+PublisherSupportUrl: https://github.com/qxlfd666-wq/codex-quota/issues
+Author: qxlfd666-wq
+PackageName: Codex Quota
+PackageUrl: https://github.com/qxlfd666-wq/codex-quota
+License: MIT
+LicenseUrl: https://github.com/qxlfd666-wq/codex-quota/blob/v1.0.1/LICENSE
+Copyright: Copyright (c) 2026 qxlfd666-wq
+ShortDescription: An unofficial overlay that shows remaining Codex quota beside your account name.
+Description: |-
+  Codex Quota is an unofficial open-source overlay for the Codex desktop app.
+  It displays your remaining usage percentage and a progress bar beside your
+  account name, and lets you customize the indicator color.
+Moniker: codex-quota
+Tags:
+- codex
+- developer-tools
+- overlay
+- quota
+- usage
+- windows
+ReleaseNotes: Fix Windows quota helper discovery.
+ReleaseNotesUrl: https://github.com/qxlfd666-wq/codex-quota/releases/tag/v1.0.1
+InstallationNotes: Run codex-quota after installation. This unofficial beta build is currently unsigned.
+Documentations:
+- DocumentLabel: Project documentation
+  DocumentUrl: https://github.com/qxlfd666-wq/codex-quota/blob/main/README.en.md
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0

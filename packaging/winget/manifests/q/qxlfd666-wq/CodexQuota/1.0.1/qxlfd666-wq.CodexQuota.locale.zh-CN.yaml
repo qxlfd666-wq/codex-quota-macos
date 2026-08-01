@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.locale.1.12.0.schema.json
+
+PackageIdentifier: qxlfd666-wq.CodexQuota
+PackageVersion: '1.0.1'
+PackageLocale: zh-CN
+Publisher: qxlfd666-wq
+PackageName: Codex Quota
+ShortDescription: 在账户名称旁显示 Codex 套餐剩余额度的非官方悬浮工具。
+Description: |-
+  Codex Quota 是面向 Codex 桌面客户端的非官方开源悬浮工具。
+  它会在账户名称旁显示剩余额度百分比和进度条，并支持自定义指示器颜色。
+Tags:
+- codex
+- 额度
+- 悬浮窗
+- 用量
+- 开发者工具
+ReleaseNotes: 修复 Windows 版额度辅助程序的发现问题。
+ReleaseNotesUrl: https://github.com/qxlfd666-wq/codex-quota/releases/tag/v1.0.1
+InstallationNotes: 安装后运行 codex-quota。当前为未签名的非官方 Beta 版本。
+ManifestType: locale
+ManifestVersion: 1.12.0

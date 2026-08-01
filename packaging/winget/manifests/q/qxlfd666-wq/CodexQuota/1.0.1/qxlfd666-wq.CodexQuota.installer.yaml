@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+
+PackageIdentifier: qxlfd666-wq.CodexQuota
+PackageVersion: '1.0.1'
+InstallerType: portable
+Scope: user
+Commands:
+- codex-quota
+ReleaseDate: '2026-08-01'
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/qxlfd666-wq/codex-quota/releases/download/v1.0.1/Codex-Quota-Windows-x64.exe
+  InstallerSha256: F01974364C5FF8E8C2A0BAD3ADEE3A78B532634D3E6AE80B85D8737079E10088
+- Architecture: arm64
+  InstallerUrl: https://github.com/qxlfd666-wq/codex-quota/releases/download/v1.0.1/Codex-Quota-Windows-arm64.exe
+  InstallerSha256: F6B2D2D53C633CC3B2088B05CCE50C7A70A9AA125AABAEF4055AAA497E1353D8
+ManifestType: installer
+ManifestVersion: 1.12.0
