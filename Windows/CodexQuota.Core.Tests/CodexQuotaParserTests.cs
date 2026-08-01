@@ -7,6 +7,30 @@ namespace CodexQuota.Core.Tests;
 public sealed class CodexQuotaParserTests
 {
     [Fact]
+    public void RateLimitsRequestOmitsParamsForSchemaCompatibility()
+    {
+        using var request = JsonDocument.Parse(CodexAppServerMessages.RateLimitsRead(3));
+
+        Assert.Equal("account/rateLimits/read", request.RootElement.GetProperty("method").GetString());
+        Assert.Equal(3, request.RootElement.GetProperty("id").GetInt32());
+        Assert.False(request.RootElement.TryGetProperty("params", out _));
+    }
+
+    [Fact]
+    public void DesktopHelperCandidatesNeverReturnTheGuiExecutable()
+    {
+        var appDirectory = Path.Combine(Path.GetTempPath(), "CodexDesktop", "app");
+        var guiExecutable = Path.Combine(appDirectory, "Codex.exe");
+
+        var candidates = CodexExecutableDiscovery.DesktopHelperCandidates(guiExecutable);
+
+        Assert.DoesNotContain(
+            candidates,
+            candidate => string.Equals(candidate, guiExecutable, StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(Path.Combine(appDirectory, "resources", "codex.exe"), candidates[0]);
+    }
+
+    [Fact]
     public void UsesCodexBucketAndStrictestWindow()
     {
         using var account = JsonDocument.Parse("""

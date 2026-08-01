@@ -125,7 +125,7 @@ actor CodexAppServerClient {
 
     do {
       let initializeRequest = """
-        {"method":"initialize","id":\(initializeRequestID),"params":{"clientInfo":{"name":"codex_quota_macos","title":"Codex Quota","version":"1.0.0"}}}
+        {"method":"initialize","id":\(initializeRequestID),"params":{"clientInfo":{"name":"codex_quota_macos","title":"Codex Quota","version":"1.0.1"}}}
 
         """
       try inputPipe.fileHandleForWriting.write(contentsOf: Data(initializeRequest.utf8))

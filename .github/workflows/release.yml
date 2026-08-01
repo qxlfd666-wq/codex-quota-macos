@@ -88,6 +88,9 @@ jobs:
       - name: Run core tests
         run: dotnet test Windows/CodexQuota.Core.Tests/CodexQuota.Core.Tests.csproj --configuration Release
 
+      - name: Run Windows app-server integration tests
+        run: dotnet test Windows/CodexQuota.Windows.Tests/CodexQuota.Windows.Tests.csproj --configuration Release
+
       - name: Publish self-contained single-file application
         shell: pwsh
         run: >-

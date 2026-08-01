@@ -1,6 +1,8 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CodexQuota.Core;
 
 namespace CodexQuota.Windows.Services;
@@ -10,88 +12,191 @@ internal sealed class CodexAppServerClient
     private const int InitializeRequestId = 1;
     private const int AccountRequestId = 2;
     private const int RateLimitsRequestId = 3;
+    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan InitializeTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan RateLimitsTimeout = TimeSpan.FromSeconds(30);
+    private static readonly string ClientVersion = GetClientVersion();
+    private static readonly Regex BearerPattern = new(
+        @"\bBearer\s+[A-Za-z0-9._~+/=-]+",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex SecretKeyPattern = new(
+        @"\bsk-[A-Za-z0-9_-]{8,}",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex JwtPattern = new(
+        @"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+        RegexOptions.CultureInvariant);
+    private static readonly Regex EmailPattern = new(
+        @"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private readonly IReadOnlyList<string>? _candidatePaths;
+
+    internal CodexAppServerClient(IReadOnlyList<string>? candidatePaths = null)
+    {
+        _candidatePaths = candidatePaths;
+    }
+
+    public string LastDiagnostic { get; private set; } = "尚未读取额度。";
 
     public async Task<QuotaSnapshot> FetchSnapshotAsync(CancellationToken cancellationToken = default)
     {
-        var command = LocateCodexCommand();
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(15));
+        var candidates = _candidatePaths is null
+            ? LocateCodexCommands()
+            : ResolveExistingCandidates(
+                _candidatePaths.Select(path => new CodexCommand(path, "测试候选")));
+        var attempts = new List<string>();
+        if (candidates.Count == 0)
+            throw Failure(
+                "未找到 Codex 命令行组件。请先打开并登录最新版 Codex，或重新安装官方客户端。",
+                null,
+                attempts);
 
-        using var process = new Process { StartInfo = CreateStartInfo(command) };
+        foreach (var candidate in candidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var probe = await ProbeAsync(candidate, cancellationToken);
+            if (!probe.IsCodexCli)
+            {
+                attempts.Add(DescribeAttempt(candidate, probe.Failure ?? "不是 codex-cli"));
+                continue;
+            }
+
+            var command = candidate with { Version = probe.Version };
+            try
+            {
+                var snapshot = await FetchFromCommandAsync(command, cancellationToken);
+                LastDiagnostic = BuildDiagnostic("额度读取成功", command, attempts);
+                return snapshot;
+            }
+            catch (CodexCandidateException exception)
+            {
+                attempts.Add(DescribeAttempt(command, exception.Message));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                var message = exception is CodexClientException or QuotaUnavailableException
+                    ? exception.Message
+                    : $"Codex 额度读取失败：{exception.Message}";
+                throw Failure(message, command, attempts, exception);
+            }
+        }
+
+        throw Failure(
+            "没有找到可用的 Codex 命令行组件。请升级或重新安装官方 Codex 后重试。",
+            null,
+            attempts);
+    }
+
+    private async Task<QuotaSnapshot> FetchFromCommandAsync(
+        CodexCommand command,
+        CancellationToken cancellationToken)
+    {
+        using var process = new Process { StartInfo = CreateStartInfo(command, "app-server") };
         try
         {
             if (!process.Start())
-                throw new CodexClientException("无法启动本机 Codex。");
+                throw new CodexCandidateException("无法启动 helper");
         }
-        catch (Exception exception) when (exception is not CodexClientException)
+        catch (Exception exception) when (exception is not CodexCandidateException)
         {
-            throw new CodexClientException($"无法启动本机 Codex：{exception.Message}", exception);
+            throw new CodexCandidateException($"无法启动 helper：{Sanitize(exception.Message)}", exception);
         }
 
         var stderrTask = process.StandardError.ReadToEndAsync();
         try
         {
-            var initializeRequest =
-                $"{{\"method\":\"initialize\",\"id\":{InitializeRequestId},\"params\":{{\"clientInfo\":{{\"name\":\"codex_quota_windows\",\"title\":\"Codex Quota\",\"version\":\"1.0.0\"}}}}}}\n";
-            await process.StandardInput.WriteAsync(initializeRequest.AsMemory(), timeout.Token);
-            await process.StandardInput.FlushAsync(timeout.Token);
-            await WaitForSuccessfulResponseAsync(
-                process.StandardOutput,
-                InitializeRequestId,
-                "Codex 初始化失败",
-                timeout.Token);
-
-            var request =
-                "{\"method\":\"initialized\",\"params\":{}}\n" +
-                $"{{\"method\":\"account/read\",\"id\":{AccountRequestId},\"params\":{{\"refreshToken\":false}}}}\n" +
-                $"{{\"method\":\"account/rateLimits/read\",\"id\":{RateLimitsRequestId},\"params\":{{}}}}\n";
-            await process.StandardInput.WriteAsync(request.AsMemory(), timeout.Token);
-            await process.StandardInput.FlushAsync(timeout.Token);
-
-            JsonElement? accountResult = null;
-            JsonElement? rateLimitsResult = null;
-            while (!timeout.IsCancellationRequested && rateLimitsResult is null)
+            using (var initializeTimeout = CreateTimeout(cancellationToken, InitializeTimeout))
             {
-                var line = await process.StandardOutput.ReadLineAsync(timeout.Token);
-                if (line is null)
-                    break;
-
-                using var document = TryParse(line);
-                if (document is null || document.RootElement.ValueKind != JsonValueKind.Object ||
-                    !TryReadId(document.RootElement, out var id))
-                    continue;
-
-                if (document.RootElement.TryGetProperty("error", out var error) && id == RateLimitsRequestId)
+                try
                 {
-                    var message = error.TryGetProperty("message", out var messageElement)
-                        ? messageElement.GetString()
-                        : null;
-                    throw new CodexClientException($"Codex 无法读取额度：{message ?? "未知错误"}");
+                    await WriteLineAsync(
+                        process.StandardInput,
+                        CodexAppServerMessages.Initialize(
+                            InitializeRequestId,
+                            "codex_quota_windows",
+                            "Codex Quota",
+                            ClientVersion),
+                        initializeTimeout.Token);
+                    await WaitForSuccessfulResponseAsync(
+                        process.StandardOutput,
+                        InitializeRequestId,
+                        initializeTimeout.Token);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw new CodexCandidateException("app-server 初始化超时");
+                }
+                catch (CodexClientException exception)
+                {
+                    throw new CodexCandidateException(exception.Message, exception);
+                }
+            }
+
+            using var requestTimeout = CreateTimeout(cancellationToken, RateLimitsTimeout);
+            try
+            {
+                var request = string.Join(
+                    '\n',
+                    CodexAppServerMessages.Initialized(),
+                    CodexAppServerMessages.AccountRead(AccountRequestId),
+                    CodexAppServerMessages.RateLimitsRead(RateLimitsRequestId));
+                await process.StandardInput.WriteAsync((request + "\n").AsMemory(), requestTimeout.Token);
+                await process.StandardInput.FlushAsync(requestTimeout.Token);
+
+                JsonElement? accountResult = null;
+                JsonElement? rateLimitsResult = null;
+                while (!requestTimeout.IsCancellationRequested && rateLimitsResult is null)
+                {
+                    var line = await process.StandardOutput.ReadLineAsync(requestTimeout.Token);
+                    if (line is null)
+                        break;
+
+                    using var document = TryParse(line);
+                    if (document is null || document.RootElement.ValueKind != JsonValueKind.Object ||
+                        !TryReadId(document.RootElement, out var id))
+                        continue;
+
+                    if (document.RootElement.TryGetProperty("error", out var error))
+                    {
+                        if (id == RateLimitsRequestId)
+                        {
+                            var message = ReadErrorMessage(error) ?? "未知错误";
+                            if (IsProtocolCompatibilityError(error))
+                                throw new CodexCandidateException($"额度接口不兼容：{message}");
+                            throw new CodexClientException($"Codex 无法读取额度：{message}");
+                        }
+                        continue;
+                    }
+
+                    if (!document.RootElement.TryGetProperty("result", out var result))
+                        continue;
+                    if (id == RateLimitsRequestId && result.ValueKind != JsonValueKind.Object)
+                        throw new CodexCandidateException("额度接口返回格式不兼容");
+                    if (result.ValueKind != JsonValueKind.Object)
+                        continue;
+                    if (id == AccountRequestId)
+                        accountResult = result.Clone();
+                    else if (id == RateLimitsRequestId)
+                        rateLimitsResult = result.Clone();
                 }
 
-                if (!document.RootElement.TryGetProperty("result", out var result) ||
-                    result.ValueKind != JsonValueKind.Object)
-                    continue;
-                if (id == AccountRequestId)
-                    accountResult = result.Clone();
-                else if (id == RateLimitsRequestId)
-                    rateLimitsResult = result.Clone();
-            }
+                if (rateLimitsResult is not { } rateLimits)
+                {
+                    if (process.HasExited)
+                        throw new CodexCandidateException(
+                            $"app-server 在返回额度前退出（代码 {process.ExitCode}）");
+                    throw new CodexClientException("Codex 返回了无法识别的额度数据。");
+                }
 
-            if (rateLimitsResult is not { } rateLimits)
+                return CodexQuotaParser.Parse(accountResult ?? EmptyObject(), rateLimits);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
-                var diagnostic = process.HasExited ? await stderrTask : string.Empty;
-                diagnostic = diagnostic.Trim();
-                throw new CodexClientException(diagnostic.Length > 0
-                    ? $"Codex 未返回额度：{diagnostic[..Math.Min(diagnostic.Length, 240)]}"
-                    : "Codex 返回了无法识别的额度数据。");
+                throw new CodexClientException("读取额度超时，请检查网络和 Codex 登录状态后重试。");
             }
-
-            return CodexQuotaParser.Parse(accountResult ?? EmptyObject(), rateLimits);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            throw new CodexClientException("读取额度超时，请检查网络后重试。");
         }
         finally
         {
@@ -122,22 +227,30 @@ internal sealed class CodexAppServerClient
             }
             catch
             {
-                // stderr is diagnostic-only and may close after the process handle.
+                // stderr is drained to prevent blocking but never stored because it may be sensitive.
             }
         }
+    }
+
+    private static async Task WriteLineAsync(
+        StreamWriter input,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        await input.WriteAsync((message + "\n").AsMemory(), cancellationToken);
+        await input.FlushAsync(cancellationToken);
     }
 
     private static async Task WaitForSuccessfulResponseAsync(
         StreamReader output,
         int expectedId,
-        string errorPrefix,
         CancellationToken cancellationToken)
     {
         while (true)
         {
             var line = await output.ReadLineAsync(cancellationToken);
             if (line is null)
-                throw new CodexClientException($"{errorPrefix}：Codex 提前退出。");
+                throw new CodexClientException("Codex 初始化失败：app-server 提前退出。");
 
             using var document = TryParse(line);
             if (document is null || document.RootElement.ValueKind != JsonValueKind.Object ||
@@ -145,22 +258,57 @@ internal sealed class CodexAppServerClient
                 continue;
 
             if (document.RootElement.TryGetProperty("error", out var error))
-            {
-                var message = error.ValueKind == JsonValueKind.Object &&
-                              error.TryGetProperty("message", out var messageElement)
-                    ? messageElement.GetString()
-                    : null;
-                throw new CodexClientException($"{errorPrefix}：{message ?? "未知错误"}");
-            }
+                throw new CodexClientException(
+                    $"Codex 初始化失败：{ReadErrorMessage(error) ?? "未知错误"}");
 
             if (document.RootElement.TryGetProperty("result", out _))
                 return;
 
-            throw new CodexClientException($"{errorPrefix}：Codex 返回了无法识别的数据。");
+            throw new CodexClientException("Codex 初始化失败：返回了无法识别的数据。");
         }
     }
 
-    private static ProcessStartInfo CreateStartInfo(CodexCommand command)
+    private static async Task<CodexProbe> ProbeAsync(
+        CodexCommand command,
+        CancellationToken cancellationToken)
+    {
+        using var process = new Process { StartInfo = CreateStartInfo(command, "--version") };
+        try
+        {
+            if (!process.Start())
+                return new CodexProbe(false, null, "无法启动版本检查");
+        }
+        catch (Exception exception)
+        {
+            return new CodexProbe(false, null, $"无法启动：{Sanitize(exception.Message)}");
+        }
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        using var timeout = CreateTimeout(cancellationToken, ProbeTimeout);
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            TryKill(process);
+            await DrainProbeAsync(process, stdoutTask, stderrTask);
+            if (cancellationToken.IsCancellationRequested)
+                throw;
+            return new CodexProbe(false, null, "版本检查超时");
+        }
+
+        var output = ((await stdoutTask) + "\n" + (await stderrTask))
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .FirstOrDefault(line => line.StartsWith("codex-cli", StringComparison.OrdinalIgnoreCase));
+        return process.ExitCode == 0 && output is not null
+            ? new CodexProbe(true, Sanitize(output), null)
+            : new CodexProbe(false, null, $"不是 codex-cli（退出代码 {process.ExitCode}）");
+    }
+
+    private static ProcessStartInfo CreateStartInfo(CodexCommand command, string argument)
     {
         ProcessStartInfo startInfo;
         if (command.Path.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) ||
@@ -169,15 +317,18 @@ internal sealed class CodexAppServerClient
             var commandProcessor = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
             startInfo = new ProcessStartInfo(commandProcessor)
             {
-                Arguments = $"/d /s /c \"\"{command.Path}\" app-server\""
+                Arguments = $"/d /s /c \"\"{command.Path}\" {argument}\""
             };
         }
         else
         {
             startInfo = new ProcessStartInfo(command.Path);
-            startInfo.ArgumentList.Add("app-server");
+            startInfo.ArgumentList.Add(argument);
         }
 
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (Directory.Exists(home))
+            startInfo.WorkingDirectory = home;
         startInfo.UseShellExecute = false;
         startInfo.CreateNoWindow = true;
         startInfo.RedirectStandardInput = true;
@@ -185,78 +336,298 @@ internal sealed class CodexAppServerClient
         startInfo.RedirectStandardError = true;
         startInfo.StandardInputEncoding = new UTF8Encoding(false);
         startInfo.StandardOutputEncoding = Encoding.UTF8;
+        startInfo.StandardErrorEncoding = Encoding.UTF8;
         return startInfo;
     }
 
-    private static CodexCommand LocateCodexCommand()
+    private static IReadOnlyList<CodexCommand> LocateCodexCommands()
     {
-        var candidates = new List<string>();
-        AddIfPresent(candidates, Environment.GetEnvironmentVariable("CODEX_QUOTA_CODEX_PATH"));
+        var candidates = new List<CodexCommand>();
+        AddCandidate(
+            candidates,
+            Environment.GetEnvironmentVariable("CODEX_QUOTA_CODEX_PATH"),
+            "CODEX_QUOTA_CODEX_PATH");
 
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        // The Codex desktop app extracts its bundled helper here on Windows.
-        candidates.Add(Path.Combine(local, "OpenAI", "Codex", "bin", "codex.exe"));
-        AddRunningDesktopAppCandidates(candidates);
-
-        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
-        {
-            candidates.Add(Path.Combine(directory.Trim('"'), "codex.exe"));
-            candidates.Add(Path.Combine(directory.Trim('"'), "codex.cmd"));
-        }
-
         var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        candidates.AddRange(new[]
-        {
-            Path.Combine(roaming, "npm", "codex.cmd"),
+
+        AddRunningDesktopAppCandidates(candidates, "Codex");
+
+        var desktopBin = Path.Combine(local, "OpenAI", "Codex", "bin");
+        AddCandidate(candidates, Path.Combine(desktopBin, "codex.exe"), "Codex 桌面 helper");
+        AddNestedBinCandidates(candidates, desktopBin, "Codex 桌面 helper");
+
+        AddMsixCacheCandidates(candidates, local);
+        AddRunningDesktopAppCandidates(candidates, "ChatGPT");
+
+        AddCandidate(
+            candidates,
+            Path.Combine(home, ".codex", "packages", "standalone", "current", "bin", "codex.exe"),
+            "Codex standalone");
+        AddCandidate(
+            candidates,
             Path.Combine(local, "Programs", "OpenAI", "Codex", "bin", "codex.exe"),
+            "Codex 安装目录");
+        AddCandidate(
+            candidates,
             Path.Combine(local, "Programs", "Codex", "resources", "codex.exe"),
-            Path.Combine(local, "Programs", "Codex", "codex.exe"),
+            "Codex 安装目录");
+        AddCandidate(
+            candidates,
             Path.Combine(local, "Programs", "ChatGPT", "resources", "codex.exe"),
-            Path.Combine(home, ".local", "bin", "codex.exe")
-        });
+            "ChatGPT 安装目录");
+        AddCandidate(candidates, Path.Combine(roaming, "npm", "codex.cmd"), "npm Codex CLI");
+        AddCandidate(candidates, Path.Combine(home, ".local", "bin", "codex.exe"), "用户 Codex CLI");
 
-        var selected = candidates
-            .Select(Environment.ExpandEnvironmentVariables)
-            .FirstOrDefault(File.Exists);
-        return selected is not null
-            ? new CodexCommand(Path.GetFullPath(Environment.ExpandEnvironmentVariables(selected)))
-            : throw new CodexClientException(
-                "未找到 Codex。请先打开并登录 ChatGPT/Codex，或安装 Codex CLI；也可以设置 CODEX_QUOTA_CODEX_PATH。");
-    }
-
-    private static void AddIfPresent(List<string> values, string? value)
-    {
-        if (!string.IsNullOrWhiteSpace(value))
-            values.Add(value.Trim().Trim('"'));
-    }
-
-    private static void AddRunningDesktopAppCandidates(List<string> candidates)
-    {
-        foreach (var processName in new[] { "ChatGPT", "Codex" })
+        var environmentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        foreach (var directory in environmentPath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
-            foreach (var process in Process.GetProcessesByName(processName))
-            {
-                using (process)
-                {
-                    try
-                    {
-                        var executable = process.MainModule?.FileName;
-                        var directory = executable is null ? null : Path.GetDirectoryName(executable);
-                        if (directory is null)
-                            continue;
+            AddCandidate(candidates, Path.Combine(directory.Trim().Trim('"'), "codex.exe"), "PATH");
+            AddCandidate(candidates, Path.Combine(directory.Trim().Trim('"'), "codex.cmd"), "PATH");
+        }
 
-                        candidates.Add(Path.Combine(directory, "codex.exe"));
-                        candidates.Add(Path.Combine(directory, "resources", "codex.exe"));
-                        candidates.Add(Path.Combine(directory, "app", "resources", "codex.exe"));
-                    }
-                    catch
-                    {
-                        // Store package ACLs can hide the executable from other processes.
-                    }
+        return ResolveExistingCandidates(candidates);
+    }
+
+    private static IReadOnlyList<CodexCommand> ResolveExistingCandidates(
+        IEnumerable<CodexCommand> candidates)
+    {
+        var existing = new List<CodexCommand>();
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                var path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(candidate.Path));
+                if (File.Exists(path))
+                    existing.Add(candidate with { Path = path });
+            }
+            catch
+            {
+                // Ignore malformed environment or PATH entries and keep checking safe candidates.
+            }
+        }
+
+        return existing
+            .DistinctBy(candidate => candidate.Path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static void AddRunningDesktopAppCandidates(
+        List<CodexCommand> candidates,
+        string processName)
+    {
+        foreach (var process in Process.GetProcessesByName(processName))
+        {
+            using (process)
+            {
+                try
+                {
+                    var executable = process.MainModule?.FileName;
+                    if (executable is null)
+                        continue;
+                    foreach (var helper in CodexExecutableDiscovery.DesktopHelperCandidates(executable))
+                        AddCandidate(candidates, helper, $"正在运行的 {processName}");
+                }
+                catch
+                {
+                    // Store package ACLs can hide the executable from other processes.
                 }
             }
+        }
+    }
+
+    private static void AddNestedBinCandidates(
+        List<CodexCommand> candidates,
+        string binDirectory,
+        string source)
+    {
+        try
+        {
+            foreach (var directory in Directory.EnumerateDirectories(binDirectory)
+                         .OrderByDescending(Directory.GetLastWriteTimeUtc))
+                AddCandidate(candidates, Path.Combine(directory, "codex.exe"), source);
+        }
+        catch
+        {
+            // The directory may not exist or may be protected by Store package ACLs.
+        }
+    }
+
+    private static void AddMsixCacheCandidates(List<CodexCommand> candidates, string local)
+    {
+        var packagesDirectory = Path.Combine(local, "Packages");
+        try
+        {
+            foreach (var packageDirectory in Directory.EnumerateDirectories(
+                         packagesDirectory,
+                         "OpenAI.Codex_*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                var binDirectory = Path.Combine(
+                    packageDirectory,
+                    "LocalCache",
+                    "Local",
+                    "OpenAI",
+                    "Codex",
+                    "bin");
+                AddCandidate(candidates, Path.Combine(binDirectory, "codex.exe"), "Codex MSIX helper");
+                AddNestedBinCandidates(candidates, binDirectory, "Codex MSIX helper");
+            }
+        }
+        catch
+        {
+            // The package cache may be absent or protected.
+        }
+    }
+
+    private static void AddCandidate(List<CodexCommand> candidates, string? path, string source)
+    {
+        if (!string.IsNullOrWhiteSpace(path))
+            candidates.Add(new CodexCommand(path.Trim().Trim('"'), source));
+    }
+
+    private CodexClientException Failure(
+        string message,
+        CodexCommand? command,
+        IReadOnlyCollection<string> attempts,
+        Exception? innerException = null)
+    {
+        LastDiagnostic = BuildDiagnostic(message, command, attempts);
+        return new CodexClientException(message, LastDiagnostic, innerException);
+    }
+
+    private static string BuildDiagnostic(
+        string status,
+        CodexCommand? command,
+        IReadOnlyCollection<string> attempts)
+    {
+        var lines = new List<string>
+        {
+            $"Codex Quota Windows {ClientVersion}",
+            $"时间：{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}",
+            $"系统：{RuntimeInformation.OSDescription.Trim()} ({RuntimeInformation.OSArchitecture})",
+            $"进程架构：{RuntimeInformation.ProcessArchitecture}",
+            $"状态：{Sanitize(status)}"
+        };
+        if (command is not null)
+        {
+            lines.Add($"Helper：{command.Source} · {command.Version ?? "版本未知"}");
+            lines.Add($"路径：{Sanitize(command.Path)}");
+        }
+
+        if (attempts.Count > 0)
+        {
+            lines.Add("候选检查：");
+            lines.AddRange(attempts.Take(8).Select(attempt => $"- {attempt}"));
+        }
+
+        lines.Add("诊断信息不主动记录登录令牌或额度响应；发送前请再检查一遍。");
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string DescribeAttempt(CodexCommand command, string failure) =>
+        $"{command.Source} · {Sanitize(command.Path)} · {Sanitize(failure)}";
+
+    private static string RedactPath(string path)
+    {
+        var replacements = new[]
+            {
+                (Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "%LOCALAPPDATA%"),
+                (Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "%APPDATA%"),
+                (Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "%USERPROFILE%")
+            }
+            .Where(item => !string.IsNullOrWhiteSpace(item.Item1))
+            .OrderByDescending(item => item.Item1.Length);
+        var redacted = path;
+        foreach (var (folder, variable) in replacements)
+            redacted = redacted.Replace(folder, variable, StringComparison.OrdinalIgnoreCase);
+        return redacted;
+    }
+
+    private static string Sanitize(string text)
+    {
+        var value = RedactPath(text).Replace('\r', ' ').Replace('\n', ' ').Trim();
+        value = BearerPattern.Replace(value, "Bearer [已隐藏]");
+        value = SecretKeyPattern.Replace(value, "[密钥已隐藏]");
+        value = JwtPattern.Replace(value, "[JWT 已隐藏]");
+        value = EmailPattern.Replace(value, "[邮箱已隐藏]");
+        return value.Length <= 240 ? value : value[..239] + "…";
+    }
+
+    private static string? ReadErrorMessage(JsonElement error)
+    {
+        if (error.ValueKind != JsonValueKind.Object ||
+            !error.TryGetProperty("message", out var messageElement) ||
+            messageElement.ValueKind != JsonValueKind.String)
+            return null;
+        var message = messageElement.GetString();
+        return string.IsNullOrWhiteSpace(message) ? null : Sanitize(message);
+    }
+
+    private static bool IsProtocolCompatibilityError(JsonElement error)
+    {
+        if (error.ValueKind == JsonValueKind.Object &&
+            error.TryGetProperty("code", out var codeElement))
+        {
+            var code = 0;
+            var hasCode = codeElement.ValueKind == JsonValueKind.Number
+                ? codeElement.TryGetInt32(out code)
+                : codeElement.ValueKind == JsonValueKind.String &&
+                  int.TryParse(codeElement.GetString(), out code);
+            if (hasCode && code is -32600 or -32601 or -32602)
+                return true;
+        }
+
+        var message = ReadErrorMessage(error);
+        return message is not null &&
+               (message.Contains("method not found", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("unknown method", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static CancellationTokenSource CreateTimeout(
+        CancellationToken cancellationToken,
+        TimeSpan duration)
+    {
+        var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(duration);
+        return timeout;
+    }
+
+    private static void TryKill(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // Best effort cleanup for a rejected executable candidate.
+        }
+    }
+
+    private static async Task DrainProbeAsync(
+        Process process,
+        Task<string> stdoutTask,
+        Task<string> stderrTask)
+    {
+        try
+        {
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // A rejected executable must not delay the next candidate.
+        }
+
+        try
+        {
+            _ = await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // Output is intentionally discarded.
         }
     }
 
@@ -278,13 +649,34 @@ internal sealed class CodexAppServerClient
 
     private static JsonElement EmptyObject() => JsonSerializer.SerializeToElement(new { });
 
-    private sealed record CodexCommand(string Path);
+    private static string GetClientVersion()
+    {
+        var version = typeof(CodexAppServerClient).Assembly.GetName().Version;
+        return version is null ? "1.0.1" : $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}";
+    }
+
+    private sealed record CodexCommand(string Path, string Source, string? Version = null);
+    private sealed record CodexProbe(bool IsCodexCli, string? Version, string? Failure);
+}
+
+internal sealed class CodexCandidateException : Exception
+{
+    public CodexCandidateException(string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+    }
 }
 
 internal sealed class CodexClientException : Exception
 {
-    public CodexClientException(string message, Exception? innerException = null)
+    public CodexClientException(
+        string message,
+        string? diagnostic = null,
+        Exception? innerException = null)
         : base(message, innerException)
     {
+        Diagnostic = diagnostic;
     }
+
+    public string? Diagnostic { get; }
 }
