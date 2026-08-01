@@ -12,6 +12,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _quotaItem;
     private readonly ToolStripMenuItem _detailItem;
+    private readonly ToolStripMenuItem _copyDiagnosticItem;
     private readonly ToolStripMenuItem _startupItem;
     private readonly System.Windows.Forms.Timer _refreshTimer;
     private readonly System.Windows.Forms.Timer _initialRefreshTimer;
@@ -29,8 +30,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
         var menu = new ContextMenuStrip();
         _quotaItem = new ToolStripMenuItem("正在读取 Codex 额度…") { Enabled = false };
         _detailItem = new ToolStripMenuItem("请稍候") { Enabled = false };
+        _copyDiagnosticItem = new ToolStripMenuItem("复制诊断信息") { Enabled = false };
+        _copyDiagnosticItem.Click += (_, _) => CopyDiagnostic();
         menu.Items.Add(_quotaItem);
         menu.Items.Add(_detailItem);
+        menu.Items.Add(_copyDiagnosticItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("刷新额度", null, async (_, _) => await RefreshAsync());
         menu.Items.Add("自定义颜色…", null, (_, _) => ChooseColor());
@@ -86,6 +90,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _quotaItem.Text = "暂时无法读取额度";
             _detailItem.Text = Shorten(exception.Message, 90);
             _notifyIcon.Text = Shorten("Codex 额度：" + exception.Message, 63);
+            _copyDiagnosticItem.Enabled = true;
         }
         finally
         {
@@ -99,6 +104,24 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _quotaItem.Text = $"Codex 剩余 {snapshot.RemainingPercent}%";
         _detailItem.Text = $"{snapshot.PlanName} · {snapshot.FetchedAt:HH:mm} 更新";
         _notifyIcon.Text = $"Codex 剩余 {snapshot.RemainingPercent}%";
+        _copyDiagnosticItem.Enabled = true;
+    }
+
+    private void CopyDiagnostic()
+    {
+        try
+        {
+            Clipboard.SetText(_client.LastDiagnostic);
+            _notifyIcon.ShowBalloonTip(1_500, "Codex Quota", "诊断信息已复制；发送前请检查内容。", ToolTipIcon.Info);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(
+                $"无法复制诊断信息：{exception.Message}",
+                "Codex Quota",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
     }
 
     private void ChooseColor()
