@@ -69,9 +69,17 @@ internal static class Program
                     new Point(-32_000, -32_000)))
                 return 15;
 
-            using var trayIcon = TrayIconRenderer.CreateForSystemTray();
+            using var trayIcon = TrayIconRenderer.CreateForSystemTray(
+                TrayIconContent.Quota(21),
+                Color.FromArgb(255, 59, 48));
             if (trayIcon.Width is < 16 or > 32 || trayIcon.Height is < 16 or > 32)
                 return 16;
+
+            using var shareCard = ShareCardRenderer.Render(
+                new ShareCardData(21, DateTimeOffset.UtcNow),
+                Color.FromArgb(255, 59, 48));
+            if (shareCard.Size != ShareCardRenderer.CardSize)
+                return 17;
         }
         catch
         {

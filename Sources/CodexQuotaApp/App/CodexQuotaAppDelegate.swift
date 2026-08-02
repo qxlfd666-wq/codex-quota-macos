@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 @MainActor
 final class CodexQuotaAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -8,6 +9,10 @@ final class CodexQuotaAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelega
   private var statusItem: NSStatusItem?
   private var quotaMenuItem: NSMenuItem?
   private var detailMenuItem: NSMenuItem?
+  private var shareCardMenuItem: NSMenuItem?
+  private var storeCancellables = Set<AnyCancellable>()
+  private var shareCardFeedbackTask: Task<Void, Never>?
+  private var isShowingShareCardCopyConfirmation = false
 
   func applicationWillFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -15,6 +20,7 @@ final class CodexQuotaAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelega
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     configureStatusItem()
+    bindQuotaPresentation()
 
     let overlayController = CodexOverlayController(
       store: store,
@@ -26,30 +32,19 @@ final class CodexQuotaAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelega
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    shareCardFeedbackTask?.cancel()
     overlayController?.stop()
   }
 
   func menuNeedsUpdate(_ menu: NSMenu) {
-    if let snapshot = store.snapshot {
-      quotaMenuItem?.title = "Codex 剩余 \(snapshot.remainingPercent)%"
-      detailMenuItem?.title =
-        "\(snapshot.planName) · \(snapshot.fetchedAt.formatted(date: .omitted, time: .shortened)) 更新"
-      statusItem?.button?.toolTip = "Codex 剩余 \(snapshot.remainingPercent)%"
-    } else if store.isRefreshing {
-      quotaMenuItem?.title = "正在读取 Codex 额度…"
-      detailMenuItem?.title = "请稍候"
-    } else {
-      quotaMenuItem?.title = "暂时无法读取额度"
-      detailMenuItem?.title = store.errorMessage ?? "请确认已登录 Codex"
-    }
+    applyQuotaPresentation()
   }
 
   private func configureStatusItem() {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    statusItem.button?.image = NSImage(
-      systemSymbolName: "percent",
-      accessibilityDescription: "Codex 剩余额度"
-    )
+    let statusItem = NSStatusBar.system.statusItem(withLength: 48)
+    statusItem.button?.title = "…%"
+    statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+    statusItem.button?.alignment = .center
     statusItem.button?.toolTip = "Codex 剩余额度"
 
     let menu = NSMenu()
@@ -72,6 +67,15 @@ final class CodexQuotaAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelega
     refreshItem.keyEquivalentModifierMask = [.command]
     refreshItem.target = self
     menu.addItem(refreshItem)
+
+    let shareCardItem = NSMenuItem(
+      title: "复制分享卡片",
+      action: #selector(copyShareCard),
+      keyEquivalent: ""
+    )
+    shareCardItem.target = self
+    shareCardItem.isEnabled = false
+    menu.addItem(shareCardItem)
 
     let customizeColorItem = NSMenuItem(
       title: "自定义颜色…",
@@ -103,6 +107,32 @@ final class CodexQuotaAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelega
     self.statusItem = statusItem
     self.quotaMenuItem = quotaMenuItem
     self.detailMenuItem = detailMenuItem
+    self.shareCardMenuItem = shareCardItem
+  }
+
+  private func bindQuotaPresentation() {
+    store.$snapshot
+      .combineLatest(store.$isRefreshing, store.$errorMessage)
+      .sink { [weak self] _, _, _ in
+        self?.applyQuotaPresentation()
+      }
+      .store(in: &storeCancellables)
+  }
+
+  private func applyQuotaPresentation() {
+    let presentation = MenuBarQuotaPresentation.make(
+      snapshot: store.snapshot,
+      isRefreshing: store.isRefreshing,
+      errorMessage: store.errorMessage,
+      shareCardWasCopied: isShowingShareCardCopyConfirmation
+    )
+    statusItem?.button?.title = presentation.buttonTitle
+    statusItem?.button?.toolTip = presentation.toolTip
+    statusItem?.button?.setAccessibilityLabel(presentation.accessibilityLabel)
+    quotaMenuItem?.title = presentation.quotaTitle
+    detailMenuItem?.title = presentation.detailTitle
+    shareCardMenuItem?.title = presentation.shareCardTitle
+    shareCardMenuItem?.isEnabled = presentation.canShare
   }
 
   @objc private func refreshQuota() {
@@ -111,6 +141,54 @@ final class CodexQuotaAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelega
 
   @objc private func customizeColor() {
     overlayController?.showColorPicker()
+  }
+
+  @objc private func copyShareCard() {
+    guard let snapshot = store.snapshot else { return }
+    let content = QuotaShareCardContent(
+      remainingPercent: snapshot.remainingPercent,
+      fetchedAt: snapshot.fetchedAt
+    )
+    guard
+      let pngData = QuotaShareCardRenderer.pngData(
+        content: content,
+        accentColor: appearanceStore.color
+      )
+    else {
+      shareCardCopyFailed()
+      return
+    }
+
+    guard QuotaShareCardPasteboard.writePNG(pngData) else {
+      shareCardCopyFailed()
+      return
+    }
+    showShareCardCopyConfirmation()
+  }
+
+  private func showShareCardCopyConfirmation() {
+    shareCardFeedbackTask?.cancel()
+    isShowingShareCardCopyConfirmation = true
+    applyQuotaPresentation()
+
+    shareCardFeedbackTask = Task { [weak self] in
+      do {
+        try await Task.sleep(for: .milliseconds(1_500))
+      } catch {
+        return
+      }
+      guard !Task.isCancelled else { return }
+      self?.isShowingShareCardCopyConfirmation = false
+      self?.applyQuotaPresentation()
+    }
+  }
+
+  private func shareCardCopyFailed() {
+    shareCardFeedbackTask?.cancel()
+    shareCardFeedbackTask = nil
+    isShowingShareCardCopyConfirmation = false
+    applyQuotaPresentation()
+    NSSound.beep()
   }
 
   @objc private func openCodex() {
