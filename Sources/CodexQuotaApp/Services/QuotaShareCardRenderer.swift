@@ -222,16 +222,17 @@ enum QuotaShareCardRenderer {
 
   private static func relativeLuminance(_ color: NSColor) -> Double {
     let converted = opaqueSRGB(color)
-    let components = [
-      Double(converted.redComponent),
-      Double(converted.greenComponent),
-      Double(converted.blueComponent),
-    ].map { component in
-      component <= 0.04045
-        ? component / 12.92
-        : pow((component + 0.055) / 1.055, 2.4)
-    }
-    return 0.2126 * components[0] + 0.7152 * components[1] + 0.0722 * components[2]
+    let red = linearChannel(converted.redComponent)
+    let green = linearChannel(converted.greenComponent)
+    let blue = linearChannel(converted.blueComponent)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+  }
+
+  private static func linearChannel(_ component: CGFloat) -> Double {
+    let value = Double(component)
+    return value <= 0.04045
+      ? value / 12.92
+      : pow((value + 0.055) / 1.055, 2.4)
   }
 
   private static func draw(

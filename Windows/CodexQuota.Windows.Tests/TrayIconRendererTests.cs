@@ -35,8 +35,10 @@ public sealed class TrayIconRendererTests
             Math.Abs(pixel.R - Accent.R) < 8 &&
             Math.Abs(pixel.G - Accent.G) < 8 &&
             Math.Abs(pixel.B - Accent.B) < 8);
+        var foreground = TrayIconRenderer.ContrastingTextColor(Accent);
         Assert.Contains(pixels, pixel =>
-            pixel.A > 230 && pixel.R > 235 && pixel.G > 235 && pixel.B > 235);
+            pixel.A > 200 &&
+            ColorDistanceSquared(pixel, foreground) < ColorDistanceSquared(pixel, Accent));
     }
 
     [Theory]
@@ -120,4 +122,9 @@ public sealed class TrayIconRendererTests
             Assert.NotEqual(nint.Zero, icon.Handle);
         }
     }
+
+    private static int ColorDistanceSquared(Color first, Color second) =>
+        ((first.R - second.R) * (first.R - second.R)) +
+        ((first.G - second.G) * (first.G - second.G)) +
+        ((first.B - second.B) * (first.B - second.B));
 }
