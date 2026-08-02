@@ -27,10 +27,10 @@
 | Platform | Direct download | Requirement |
 | --- | --- | --- |
 | macOS — Apple Silicon and Intel | [Codex-Quota-macOS.zip](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-macOS.zip) | macOS 14 or later |
-| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
-| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
+| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
+| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
 
-The [latest release](https://github.com/qxlfd666-wq/codex-quota/releases/latest) also contains Windows `.zip` packages and a `.sha256` file for every download.
+The [Windows v1.1.0 release](https://github.com/qxlfd666-wq/codex-quota/releases/tag/windows-v1.1.0) also contains Windows `.zip` packages and a `.sha256` file for every Windows download.
 
 > [!WARNING]
 > Current community builds are not signed with an Apple Developer ID or a commercial Windows code-signing certificate. macOS Gatekeeper or Microsoft Defender SmartScreen may therefore show an unknown-publisher warning. Download only from this repository's Releases page and verify the matching SHA-256 file. The Windows build should be treated as Beta while signing and wider installer coverage are being prepared.
@@ -145,16 +145,22 @@ On Windows with the .NET 8 SDK:
 dotnet run --project Windows/CodexQuota.Windows/CodexQuota.Windows.csproj
 ```
 
-Build a self-contained, single-file x64 executable:
+Build a self-contained, single-file executable (use `win-arm64` for ARM64):
 
 ```powershell
+$runtime = "win-x64"
 dotnet publish Windows/CodexQuota.Windows/CodexQuota.Windows.csproj `
   --configuration Release `
-  --runtime win-x64 `
+  --runtime $runtime `
   --self-contained true `
+  --output "artifacts/$runtime" `
   -p:PublishSingleFile=true `
-  -p:IncludeNativeLibrariesForSelfExtract=true
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:DebugType=None `
+  -p:DebugSymbols=false
 ```
+
+The Windows implementation has four projects: `CodexQuota.Core` provides stable models and quota parsing, `CodexQuota.Windows` provides the tray app, overlay tracking, and local app-server communication, and the two test projects cover the parser and Windows integration behavior.
 
 ## Test
 
@@ -164,7 +170,7 @@ dotnet test Windows/CodexQuota.Core.Tests/CodexQuota.Core.Tests.csproj
 dotnet test Windows/CodexQuota.Windows.Tests/CodexQuota.Windows.Tests.csproj
 ```
 
-GitHub Actions checks the macOS and Windows builds on pull requests and changes to `main`. Pushing a `v*` tag creates a GitHub Release with platform packages and SHA-256 files.
+GitHub Actions checks the macOS and Windows builds on pull requests and changes to `main`. A `v*` tag creates a combined platform release; a `windows-v*` tag creates a Windows-only release without replacing the latest macOS release.
 
 ## Data and privacy
 

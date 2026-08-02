@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 
 namespace CodexQuota.Core;
@@ -50,10 +51,20 @@ public static class CodexQuotaParser
         int? duration = TryGetInt(window, "windowDurationMins", out var minutes)
             ? minutes
             : null;
-        DateTimeOffset? resetsAt = TryGetDouble(window, "resetsAt", out var timestamp)
-            ? DateTimeOffset.FromUnixTimeSeconds((long)timestamp)
+        var resetsAt = TryGetDouble(window, "resetsAt", out var timestamp)
+            ? ParseUnixTimestamp(timestamp)
             : null;
         return new QuotaWindow(Math.Clamp(used, 0, 100), duration, resetsAt);
+    }
+
+    private static DateTimeOffset? ParseUnixTimestamp(double timestamp)
+    {
+        if (!double.IsFinite(timestamp) ||
+            timestamp < DateTimeOffset.MinValue.ToUnixTimeSeconds() ||
+            timestamp > DateTimeOffset.MaxValue.ToUnixTimeSeconds())
+            return null;
+
+        return DateTimeOffset.FromUnixTimeSeconds((long)timestamp);
     }
 
     private static JsonElement? TryGetObject(JsonElement? parent, string propertyName)
@@ -82,7 +93,8 @@ public static class CodexQuotaParser
             return false;
         if (result.ValueKind == JsonValueKind.Number)
             return result.TryGetInt32(out value);
-        return result.ValueKind == JsonValueKind.String && int.TryParse(result.GetString(), out value);
+        return result.ValueKind == JsonValueKind.String &&
+               int.TryParse(result.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
     }
 
     private static bool TryGetDouble(JsonElement parent, string propertyName, out double value)
@@ -92,7 +104,8 @@ public static class CodexQuotaParser
             return false;
         if (result.ValueKind == JsonValueKind.Number)
             return result.TryGetDouble(out value);
-        return result.ValueKind == JsonValueKind.String && double.TryParse(result.GetString(), out value);
+        return result.ValueKind == JsonValueKind.String &&
+               double.TryParse(result.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
     }
 
     private static string DisplayName(string? email)

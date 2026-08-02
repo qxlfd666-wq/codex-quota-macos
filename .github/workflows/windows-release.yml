@@ -1,59 +1,18 @@
-name: Release
+name: Windows Release
 
 on:
   push:
     tags:
-      - "v*"
+      - "windows-v*"
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: windows-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  macos:
-    name: Build universal macOS release
-    runs-on: macos-15
-    timeout-minutes: 20
-    steps:
-      - name: Check out tagged source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Verify tag matches application version
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected="v$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' AppResources/Info.plist)"
-          if [[ "$GITHUB_REF_NAME" != "$expected" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match Info.plist version $expected" >&2
-            exit 1
-          fi
-
-      - name: Run tests
-        run: swift test
-
-      - name: Build universal application bundle
-        run: ./scripts/build-universal-app.sh
-
-      - name: Verify and name release archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          asset="Codex-Quota-macOS.zip"
-          cp "dist/Codex Quota Universal.zip" "release-assets/$asset"
-          (cd release-assets && shasum -a 256 "$asset" > "$asset.sha256")
-
-      - name: Upload macOS release assets
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-macos
-          path: release-assets/
-          if-no-files-found: error
-          retention-days: 7
-
   windows:
     name: Build Windows ${{ matrix.arch }} release
     runs-on: windows-2022
@@ -80,7 +39,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           [xml]$project = Get-Content Windows/CodexQuota.Windows/CodexQuota.Windows.csproj
-          $expected = "v$($project.Project.PropertyGroup.Version)"
+          $expected = "windows-v$($project.Project.PropertyGroup.Version)"
           if ($env:GITHUB_REF_NAME -ne $expected) {
             throw "Tag $env:GITHUB_REF_NAME does not match Windows project version $expected"
           }
@@ -155,10 +114,8 @@ jobs:
           retention-days: 7
 
   release:
-    name: Publish GitHub Release
-    needs:
-      - macos
-      - windows
+    name: Publish Windows GitHub Release
+    needs: windows
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -167,10 +124,10 @@ jobs:
       - name: Check out release metadata
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Download release assets
+      - name: Download Windows release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: release-*
+          pattern: release-windows-*
           path: release-assets
           merge-multiple: true
 
@@ -181,7 +138,7 @@ jobs:
           find release-assets -maxdepth 1 -type f -print
           (cd release-assets && sha256sum --check *.sha256)
 
-      - name: Create GitHub Release
+      - name: Create Windows GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -191,6 +148,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             release-assets/* \
             --verify-tag \
-            --generate-notes \
-            --notes-file .github/release-preamble.md \
-            --title "Codex Quota ${GITHUB_REF_NAME#v}"
+            --latest=false \
+            --notes-file .github/windows-release-notes.md \
+            --title "Codex Quota for Windows ${GITHUB_REF_NAME#windows-v}"

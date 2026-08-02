@@ -87,4 +87,18 @@ public sealed class CodexQuotaParserTests
         Assert.Throws<QuotaUnavailableException>(() =>
             CodexQuotaParser.Parse(account.RootElement, limits.RootElement));
     }
+
+    [Fact]
+    public void IgnoresOutOfRangeResetTimestampWithoutLosingQuota()
+    {
+        using var account = JsonDocument.Parse("{}");
+        using var limits = JsonDocument.Parse("""
+            {"rateLimits":{"primary":{"usedPercent":12,"resetsAt":999999999999}}}
+            """);
+
+        var snapshot = CodexQuotaParser.Parse(account.RootElement, limits.RootElement);
+
+        Assert.Equal(88, snapshot.RemainingPercent);
+        Assert.Null(snapshot.Primary?.ResetsAt);
+    }
 }

@@ -27,10 +27,10 @@
 | 平台 | 直接下载 | 系统要求 |
 | --- | --- | --- |
 | macOS — Apple Silicon 与 Intel | [Codex-Quota-macOS.zip](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-macOS.zip) | macOS 14 或更高版本 |
-| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
-| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
+| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
+| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
 
-[最新 Release](https://github.com/qxlfd666-wq/codex-quota/releases/latest) 还包含 Windows `.zip` 包，以及每个下载文件对应的 `.sha256` 校验文件。
+[Windows v1.1.0 Release](https://github.com/qxlfd666-wq/codex-quota/releases/tag/windows-v1.1.0) 还包含 Windows `.zip` 包，以及每个 Windows 下载文件对应的 `.sha256` 校验文件。
 
 > [!WARNING]
 > 当前社区构建尚未使用 Apple Developer ID 或 Windows 商业代码签名证书，因此 macOS Gatekeeper 或 Microsoft Defender SmartScreen 可能显示未知开发者提示。请只从本仓库 Releases 下载，并核对对应的 SHA-256。完成签名与更广泛的安装环境验证前，Windows 版应视为 Beta 测试版。
@@ -145,16 +145,22 @@ open "dist/Codex Quota.app"
 dotnet run --project Windows/CodexQuota.Windows/CodexQuota.Windows.csproj
 ```
 
-构建自包含的 x64 单文件程序：
+构建自包含单文件 `.exe`（将 `$runtime` 改为 `win-arm64` 可构建 ARM64 版本）：
 
 ```powershell
+$runtime = "win-x64"
 dotnet publish Windows/CodexQuota.Windows/CodexQuota.Windows.csproj `
   --configuration Release `
-  --runtime win-x64 `
+  --runtime $runtime `
   --self-contained true `
+  --output "artifacts/$runtime" `
   -p:PublishSingleFile=true `
-  -p:IncludeNativeLibrariesForSelfExtract=true
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:DebugType=None `
+  -p:DebugSymbols=false
 ```
+
+Windows 版本由四个项目组成：`CodexQuota.Core` 负责稳定的数据模型和额度解析，`CodexQuota.Windows` 负责托盘、窗口跟随和本机 app-server 通信，两个测试项目分别覆盖解析器和 Windows 集成行为。
 
 ## 测试
 
@@ -164,7 +170,7 @@ dotnet test Windows/CodexQuota.Core.Tests/CodexQuota.Core.Tests.csproj
 dotnet test Windows/CodexQuota.Windows.Tests/CodexQuota.Windows.Tests.csproj
 ```
 
-GitHub Actions 会在 Pull Request 和 `main` 分支变更时验证 macOS 与 Windows 构建；推送 `v*` 标签后会自动创建 GitHub Release，并附带各平台安装包与 SHA-256 文件。
+GitHub Actions 会在 Pull Request 和 `main` 分支变更时验证 macOS 与 Windows 构建；推送 `v*` 标签会创建全平台 Release，推送 `windows-v*` 标签会创建 Windows-only Release，且不会替换 macOS 的 Latest Release。
 
 ## 数据来源与隐私
 
