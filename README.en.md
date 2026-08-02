@@ -27,10 +27,10 @@
 | Platform | Direct download | Requirement |
 | --- | --- | --- |
 | macOS — Apple Silicon and Intel | [Codex-Quota-macOS.zip](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-macOS.zip) | macOS 14 or later |
-| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
-| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
+| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/v1.2.0/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
+| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/v1.2.0/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
 
-The [Windows v1.1.0 release](https://github.com/qxlfd666-wq/codex-quota/releases/tag/windows-v1.1.0) also contains Windows `.zip` packages and a `.sha256` file for every Windows download.
+The [v1.2.0 cross-platform release](https://github.com/qxlfd666-wq/codex-quota/releases/tag/v1.2.0) also contains Windows `.zip` packages and a `.sha256` file for every download.
 
 > [!WARNING]
 > Current community builds are not signed with an Apple Developer ID or a commercial Windows code-signing certificate. macOS Gatekeeper or Microsoft Defender SmartScreen may therefore show an unknown-publisher warning. Download only from this repository's Releases page and verify the matching SHA-256 file. The Windows build should be treated as Beta while signing and wider installer coverage are being prepared.

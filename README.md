@@ -27,10 +27,10 @@
 | 平台 | 直接下载 | 系统要求 |
 | --- | --- | --- |
 | macOS — Apple Silicon 与 Intel | [Codex-Quota-macOS.zip](https://github.com/qxlfd666-wq/codex-quota/releases/latest/download/Codex-Quota-macOS.zip) | macOS 14 或更高版本 |
-| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
-| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/windows-v1.1.0/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
+| Windows x64 **Beta** | [Codex-Quota-Windows-x64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/v1.2.0/Codex-Quota-Windows-x64.exe) | Windows 10/11 x64 |
+| Windows ARM64 **Beta** | [Codex-Quota-Windows-arm64.exe](https://github.com/qxlfd666-wq/codex-quota/releases/download/v1.2.0/Codex-Quota-Windows-arm64.exe) | Windows 11 ARM64 |
 
-[Windows v1.1.0 Release](https://github.com/qxlfd666-wq/codex-quota/releases/tag/windows-v1.1.0) 还包含 Windows `.zip` 包，以及每个 Windows 下载文件对应的 `.sha256` 校验文件。
+[v1.2.0 全平台 Release](https://github.com/qxlfd666-wq/codex-quota/releases/tag/v1.2.0) 还包含 Windows `.zip` 包，以及每个下载文件对应的 `.sha256` 校验文件。
 
 > [!WARNING]
 > 当前社区构建尚未使用 Apple Developer ID 或 Windows 商业代码签名证书，因此 macOS Gatekeeper 或 Microsoft Defender SmartScreen 可能显示未知开发者提示。请只从本仓库 Releases 下载，并核对对应的 SHA-256。完成签名与更广泛的安装环境验证前，Windows 版应视为 Beta 测试版。
