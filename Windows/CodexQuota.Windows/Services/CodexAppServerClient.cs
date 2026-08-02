@@ -713,7 +713,7 @@ internal sealed class CodexAppServerClient
     private static string GetClientVersion()
     {
         var version = typeof(CodexAppServerClient).Assembly.GetName().Version;
-        return version is null ? "1.1.0" : $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}";
+        return version is null ? "1.2.0" : $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}";
     }
 
     private sealed record CodexCommand(string Path, string Source, string? Version = null);
