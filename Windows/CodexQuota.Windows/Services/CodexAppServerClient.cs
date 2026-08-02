@@ -15,6 +15,8 @@ internal sealed class CodexAppServerClient
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan InitializeTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan RateLimitsTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan GracefulExitTimeout = TimeSpan.FromSeconds(2);
+    private const int ProbeOutputCharacterLimit = 8 * 1024;
     private static readonly string ClientVersion = GetClientVersion();
     private static readonly Regex BearerPattern = new(
         @"\bBearer\s+[A-Za-z0-9._~+/=-]+",
@@ -39,10 +41,13 @@ internal sealed class CodexAppServerClient
 
     public async Task<QuotaSnapshot> FetchSnapshotAsync(CancellationToken cancellationToken = default)
     {
-        var candidates = _candidatePaths is null
-            ? LocateCodexCommands()
-            : ResolveExistingCandidates(
-                _candidatePaths.Select(path => new CodexCommand(path, "测试候选")));
+        var candidates = await Task.Run(
+                () => _candidatePaths is null
+                    ? LocateCodexCommands()
+                    : ResolveExistingCandidates(
+                        _candidatePaths.Select(path => new CodexCommand(path, "测试候选"))),
+                cancellationToken)
+            .ConfigureAwait(false);
         var attempts = new List<string>();
         if (candidates.Count == 0)
             throw Failure(
@@ -53,7 +58,7 @@ internal sealed class CodexAppServerClient
         foreach (var candidate in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var probe = await ProbeAsync(candidate, cancellationToken);
+            var probe = await ProbeAsync(candidate, cancellationToken).ConfigureAwait(false);
             if (!probe.IsCodexCli)
             {
                 attempts.Add(DescribeAttempt(candidate, probe.Failure ?? "不是 codex-cli"));
@@ -63,7 +68,7 @@ internal sealed class CodexAppServerClient
             var command = candidate with { Version = probe.Version };
             try
             {
-                var snapshot = await FetchFromCommandAsync(command, cancellationToken);
+                var snapshot = await FetchFromCommandAsync(command, cancellationToken).ConfigureAwait(false);
                 LastDiagnostic = BuildDiagnostic("额度读取成功", command, attempts);
                 return snapshot;
             }
@@ -105,7 +110,7 @@ internal sealed class CodexAppServerClient
             throw new CodexCandidateException($"无法启动 helper：{Sanitize(exception.Message)}", exception);
         }
 
-        var stderrTask = process.StandardError.ReadToEndAsync();
+        var stderrTask = process.StandardError.BaseStream.CopyToAsync(Stream.Null);
         try
         {
             using (var initializeTimeout = CreateTimeout(cancellationToken, InitializeTimeout))
@@ -119,11 +124,11 @@ internal sealed class CodexAppServerClient
                             "codex_quota_windows",
                             "Codex Quota",
                             ClientVersion),
-                        initializeTimeout.Token);
+                        initializeTimeout.Token).ConfigureAwait(false);
                     await WaitForSuccessfulResponseAsync(
                         process.StandardOutput,
                         InitializeRequestId,
-                        initializeTimeout.Token);
+                        initializeTimeout.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
                 {
@@ -143,14 +148,18 @@ internal sealed class CodexAppServerClient
                     CodexAppServerMessages.Initialized(),
                     CodexAppServerMessages.AccountRead(AccountRequestId),
                     CodexAppServerMessages.RateLimitsRead(RateLimitsRequestId));
-                await process.StandardInput.WriteAsync((request + "\n").AsMemory(), requestTimeout.Token);
-                await process.StandardInput.FlushAsync(requestTimeout.Token);
+                await process.StandardInput.WriteAsync((request + "\n").AsMemory(), requestTimeout.Token)
+                    .ConfigureAwait(false);
+                await process.StandardInput.FlushAsync(requestTimeout.Token).ConfigureAwait(false);
 
                 JsonElement? accountResult = null;
+                var accountResponseReceived = false;
                 JsonElement? rateLimitsResult = null;
-                while (!requestTimeout.IsCancellationRequested && rateLimitsResult is null)
+                while (!accountResponseReceived || rateLimitsResult is null)
                 {
-                    var line = await process.StandardOutput.ReadLineAsync(requestTimeout.Token);
+                    requestTimeout.Token.ThrowIfCancellationRequested();
+                    var line = await process.StandardOutput.ReadLineAsync(requestTimeout.Token)
+                        .ConfigureAwait(false);
                     if (line is null)
                         break;
 
@@ -161,6 +170,12 @@ internal sealed class CodexAppServerClient
 
                     if (document.RootElement.TryGetProperty("error", out var error))
                     {
+                        if (id == AccountRequestId)
+                        {
+                            accountResponseReceived = true;
+                            continue;
+                        }
+
                         if (id == RateLimitsRequestId)
                         {
                             var message = ReadErrorMessage(error) ?? "未知错误";
@@ -175,12 +190,17 @@ internal sealed class CodexAppServerClient
                         continue;
                     if (id == RateLimitsRequestId && result.ValueKind != JsonValueKind.Object)
                         throw new CodexCandidateException("额度接口返回格式不兼容");
-                    if (result.ValueKind != JsonValueKind.Object)
-                        continue;
                     if (id == AccountRequestId)
-                        accountResult = result.Clone();
+                    {
+                        accountResponseReceived = true;
+                        if (result.ValueKind == JsonValueKind.Object)
+                            accountResult = result.Clone();
+                    }
                     else if (id == RateLimitsRequestId)
-                        rateLimitsResult = result.Clone();
+                    {
+                        if (result.ValueKind == JsonValueKind.Object)
+                            rateLimitsResult = result.Clone();
+                    }
                 }
 
                 if (rateLimitsResult is not { } rateLimits)
@@ -200,35 +220,7 @@ internal sealed class CodexAppServerClient
         }
         finally
         {
-            try
-            {
-                process.StandardInput.Close();
-                if (!process.HasExited)
-                    process.Kill(entireProcessTree: true);
-            }
-            catch
-            {
-                // The short-lived app-server may already have exited.
-            }
-
-            try
-            {
-                using var exitTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                await process.WaitForExitAsync(exitTimeout.Token);
-            }
-            catch
-            {
-                // Do not hold up the tray app if process cleanup races with exit.
-            }
-
-            try
-            {
-                _ = await stderrTask.WaitAsync(TimeSpan.FromSeconds(1));
-            }
-            catch
-            {
-                // stderr is drained to prevent blocking but never stored because it may be sensitive.
-            }
+            await StopProcessAsync(process, stderrTask).ConfigureAwait(false);
         }
     }
 
@@ -237,8 +229,8 @@ internal sealed class CodexAppServerClient
         string message,
         CancellationToken cancellationToken)
     {
-        await input.WriteAsync((message + "\n").AsMemory(), cancellationToken);
-        await input.FlushAsync(cancellationToken);
+        await input.WriteAsync((message + "\n").AsMemory(), cancellationToken).ConfigureAwait(false);
+        await input.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task WaitForSuccessfulResponseAsync(
@@ -248,7 +240,7 @@ internal sealed class CodexAppServerClient
     {
         while (true)
         {
-            var line = await output.ReadLineAsync(cancellationToken);
+            var line = await output.ReadLineAsync(cancellationToken).ConfigureAwait(false);
             if (line is null)
                 throw new CodexClientException("Codex 初始化失败：app-server 提前退出。");
 
@@ -283,23 +275,24 @@ internal sealed class CodexAppServerClient
             return new CodexProbe(false, null, $"无法启动：{Sanitize(exception.Message)}");
         }
 
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
+        var stdoutTask = ReadBoundedTextAsync(process.StandardOutput);
+        var stderrTask = ReadBoundedTextAsync(process.StandardError);
         using var timeout = CreateTimeout(cancellationToken, ProbeTimeout);
         try
         {
-            await process.WaitForExitAsync(timeout.Token);
+            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
             TryKill(process);
-            await DrainProbeAsync(process, stdoutTask, stderrTask);
+            await DrainProbeAsync(process, stdoutTask, stderrTask).ConfigureAwait(false);
             if (cancellationToken.IsCancellationRequested)
                 throw;
             return new CodexProbe(false, null, "版本检查超时");
         }
 
-        var output = ((await stdoutTask) + "\n" + (await stderrTask))
+        var output = ((await stdoutTask.ConfigureAwait(false)) + "\n" +
+                      (await stderrTask.ConfigureAwait(false)))
             .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
             .Select(line => line.Trim())
             .FirstOrDefault(line => line.StartsWith("codex-cli", StringComparison.OrdinalIgnoreCase));
@@ -607,6 +600,70 @@ internal sealed class CodexAppServerClient
         }
     }
 
+    private static async Task StopProcessAsync(Process process, Task stderrTask)
+    {
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch
+        {
+            // The short-lived app-server may already have closed its input pipe.
+        }
+
+        var exitedGracefully = false;
+        try
+        {
+            using var gracefulExit = new CancellationTokenSource(GracefulExitTimeout);
+            await process.WaitForExitAsync(gracefulExit.Token).ConfigureAwait(false);
+            exitedGracefully = true;
+        }
+        catch
+        {
+            // Give EOF a chance to stop the helper before falling back to a hard kill.
+        }
+
+        if (!exitedGracefully)
+        {
+            TryKill(process);
+            try
+            {
+                await process.WaitForExitAsync()
+                    .WaitAsync(GracefulExitTimeout)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // Do not hold up the tray app if process cleanup races with exit.
+            }
+        }
+
+        try
+        {
+            await stderrTask.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+        }
+        catch
+        {
+            // stderr is streamed to a null sink and never retained because it may be sensitive.
+        }
+    }
+
+    private static async Task<string> ReadBoundedTextAsync(StreamReader reader)
+    {
+        var output = new StringBuilder(ProbeOutputCharacterLimit);
+        var buffer = new char[1024];
+        while (true)
+        {
+            var count = await reader.ReadAsync(buffer.AsMemory()).ConfigureAwait(false);
+            if (count == 0)
+                return output.ToString();
+
+            var remaining = ProbeOutputCharacterLimit - output.Length;
+            if (remaining > 0)
+                output.Append(buffer, 0, Math.Min(count, remaining));
+        }
+    }
+
     private static async Task DrainProbeAsync(
         Process process,
         Task<string> stdoutTask,
@@ -614,7 +671,9 @@ internal sealed class CodexAppServerClient
     {
         try
         {
-            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(1));
+            await process.WaitForExitAsync()
+                .WaitAsync(TimeSpan.FromSeconds(1))
+                .ConfigureAwait(false);
         }
         catch
         {
@@ -623,7 +682,9 @@ internal sealed class CodexAppServerClient
 
         try
         {
-            _ = await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(1));
+            _ = await Task.WhenAll(stdoutTask, stderrTask)
+                .WaitAsync(TimeSpan.FromSeconds(1))
+                .ConfigureAwait(false);
         }
         catch
         {
@@ -652,7 +713,7 @@ internal sealed class CodexAppServerClient
     private static string GetClientVersion()
     {
         var version = typeof(CodexAppServerClient).Assembly.GetName().Version;
-        return version is null ? "1.0.2" : $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}";
+        return version is null ? "1.1.0" : $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}";
     }
 
     private sealed record CodexCommand(string Path, string Source, string? Version = null);

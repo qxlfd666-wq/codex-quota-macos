@@ -1,6 +1,6 @@
-using System.Drawing.Drawing2D;
 using CodexQuota.Core;
 using CodexQuota.Windows.Services;
+using Microsoft.Win32;
 
 namespace CodexQuota.Windows;
 
@@ -10,22 +10,36 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly AppSettingsStore _settingsStore = new();
     private readonly OverlayForm _overlay = new();
     private readonly NotifyIcon _notifyIcon;
+    private Icon? _trayIcon;
     private readonly ToolStripMenuItem _quotaItem;
     private readonly ToolStripMenuItem _detailItem;
     private readonly ToolStripMenuItem _copyDiagnosticItem;
     private readonly ToolStripMenuItem _startupItem;
     private readonly System.Windows.Forms.Timer _refreshTimer;
     private readonly System.Windows.Forms.Timer _initialRefreshTimer;
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private readonly bool _activateRunningCodex;
     private AppSettings _settings;
+    private nint _codexWindowBeforeTrayInteraction;
     private int _refreshing;
 
-    public TrayApplicationContext()
+    public TrayApplicationContext(bool activateRunningCodex)
     {
+        _activateRunningCodex = activateRunningCodex;
+        try
+        {
+            StartupManager.MigrateLegacyEntry();
+        }
+        catch (Exception)
+        {
+            // Startup registration is optional and must not prevent the tray app
+            // from running if policy blocks registry writes.
+        }
         _settings = _settingsStore.Load();
         if (!AppSettingsStore.TryParseColor(_settings.BadgeColor, out var color))
             color = Color.FromArgb(255, 59, 48);
         _overlay.SetAccentColor(color);
-        _overlay.ChooseColorRequested += (_, _) => ChooseColor();
+        _overlay.ChooseColorRequested += (_, _) => ChooseColor(_overlay.TrackedCodexWindow);
 
         var menu = new ContextMenuStrip();
         _quotaItem = new ToolStripMenuItem("正在读取 Codex 额度…") { Enabled = false };
@@ -37,7 +51,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_copyDiagnosticItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("刷新额度", null, async (_, _) => await RefreshAsync());
-        menu.Items.Add("自定义颜色…", null, (_, _) => ChooseColor());
+        menu.Items.Add("自定义颜色…", null, (_, _) =>
+            ChooseColor(_codexWindowBeforeTrayInteraction));
         _startupItem = new ToolStripMenuItem("开机自动启动")
         {
             Checked = StartupManager.IsEnabled,
@@ -48,12 +63,22 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出额度徽标", null, (_, _) => ExitThread());
 
+        _trayIcon = TrayIconRenderer.CreateForSystemTray();
         _notifyIcon = new NotifyIcon
         {
             ContextMenuStrip = menu,
-            Icon = CreateTrayIcon(),
+            Icon = _trayIcon,
             Text = "Codex 剩余额度",
             Visible = true
+        };
+        SystemEvents.DisplaySettingsChanged += SystemDisplaySettingsChanged;
+        SystemEvents.UserPreferenceChanged += SystemUserPreferenceChanged;
+        _notifyIcon.MouseDown += (_, _) =>
+        {
+            _codexWindowBeforeTrayInteraction =
+                NativeMethods.TryGetCodexForegroundWindow(out var codexWindow)
+                    ? codexWindow.Handle
+                    : 0;
         };
         _notifyIcon.DoubleClick += async (_, _) => await RefreshAsync();
 
@@ -70,6 +95,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private async void InitialRefresh(object? sender, EventArgs eventArgs)
     {
         _initialRefreshTimer.Stop();
+        if (_activateRunningCodex && NativeMethods.TryActivateVisibleCodexWindow())
+            _overlay.RefreshPlacement();
         await RefreshAsync();
     }
 
@@ -80,10 +107,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         _quotaItem.Text = "正在读取 Codex 额度…";
         _detailItem.Text = "请稍候";
+        _overlay.SetLoading();
         try
         {
-            var snapshot = await _client.FetchSnapshotAsync();
+            var snapshot = await _client.FetchSnapshotAsync(_lifetimeCancellation.Token);
             ShowSnapshot(snapshot);
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            return;
         }
         catch (Exception exception)
         {
@@ -91,6 +123,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _detailItem.Text = Shorten(exception.Message, 90);
             _notifyIcon.Text = Shorten("Codex 额度：" + exception.Message, 63);
             _copyDiagnosticItem.Enabled = true;
+            _overlay.SetError(exception.Message);
         }
         finally
         {
@@ -124,32 +157,41 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private void ChooseColor()
+    private void ChooseColor(nint codexWindow)
     {
-        AppSettingsStore.TryParseColor(_settings.BadgeColor, out var currentColor);
-        using var dialog = new ColorDialog
-        {
-            AllowFullOpen = true,
-            AnyColor = true,
-            FullOpen = true,
-            Color = currentColor.IsEmpty ? Color.Red : currentColor
-        };
-        if (dialog.ShowDialog() != DialogResult.OK)
-            return;
-
-        _settings = _settings with { BadgeColor = AppSettingsStore.SerializeColor(dialog.Color) };
-        _overlay.SetAccentColor(dialog.Color);
         try
         {
-            _settingsStore.Save(_settings);
+            AppSettingsStore.TryParseColor(_settings.BadgeColor, out var currentColor);
+            using var dialog = new ColorDialog
+            {
+                AllowFullOpen = true,
+                AnyColor = true,
+                FullOpen = true,
+                Color = currentColor.IsEmpty ? Color.Red : currentColor
+            };
+            if (dialog.ShowDialog() != DialogResult.OK)
+                return;
+
+            _settings = _settings with { BadgeColor = AppSettingsStore.SerializeColor(dialog.Color) };
+            _overlay.SetAccentColor(dialog.Color);
+            try
+            {
+                _settingsStore.Save(_settings);
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(
+                    $"无法保存颜色：{exception.Message}",
+                    "Codex Quota",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
         }
-        catch (Exception exception)
+        finally
         {
-            MessageBox.Show(
-                $"无法保存颜色：{exception.Message}",
-                "Codex Quota",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
+            if (codexWindow != 0 && NativeMethods.TryActivateCodexWindow(codexWindow))
+                _overlay.RefreshPlacement();
+            _codexWindowBeforeTrayInteraction = 0;
         }
     }
 
@@ -170,31 +212,48 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private static Icon CreateTrayIcon()
+    private void SystemDisplaySettingsChanged(object? sender, EventArgs eventArgs) =>
+        QueueTrayIconRefresh();
+
+    private void SystemUserPreferenceChanged(
+        object sender,
+        UserPreferenceChangedEventArgs eventArgs) =>
+        QueueTrayIconRefresh();
+
+    private void QueueTrayIconRefresh()
     {
-        using var bitmap = new Bitmap(32, 32);
-        using var graphics = Graphics.FromImage(bitmap);
-        graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        graphics.Clear(Color.Transparent);
-        using var background = new SolidBrush(Color.FromArgb(255, 59, 48));
-        graphics.FillEllipse(background, 1, 1, 30, 30);
-        using var font = new Font("Segoe UI", 15, FontStyle.Bold, GraphicsUnit.Pixel);
-        TextRenderer.DrawText(
-            graphics,
-            "%",
-            font,
-            new Rectangle(1, 1, 30, 30),
-            Color.White,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-        var handle = bitmap.GetHicon();
+        if (_lifetimeCancellation.IsCancellationRequested ||
+            !_overlay.IsHandleCreated ||
+            _overlay.IsDisposed)
+            return;
+
         try
         {
-            using var icon = Icon.FromHandle(handle);
-            return (Icon)icon.Clone();
+            _overlay.BeginInvoke(RefreshTrayIcon);
         }
-        finally
+        catch (InvalidOperationException)
         {
-            NativeMethods.DestroyIcon(handle);
+            // The application is already shutting down.
+        }
+    }
+
+    private void RefreshTrayIcon()
+    {
+        if (_lifetimeCancellation.IsCancellationRequested)
+            return;
+
+        try
+        {
+            var nextIcon = TrayIconRenderer.CreateForSystemTray();
+            var previousIcon = _trayIcon;
+            _trayIcon = nextIcon;
+            _notifyIcon.Icon = nextIcon;
+            previousIcon?.Dispose();
+        }
+        catch (Exception)
+        {
+            // Keep the current icon if Windows cannot recreate it while display
+            // or accessibility settings are in transition.
         }
     }
 
@@ -203,11 +262,16 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        _lifetimeCancellation.Cancel();
         _initialRefreshTimer.Stop();
         _refreshTimer.Stop();
+        SystemEvents.DisplaySettingsChanged -= SystemDisplaySettingsChanged;
+        SystemEvents.UserPreferenceChanged -= SystemUserPreferenceChanged;
         _overlay.Close();
         _notifyIcon.Visible = false;
+        _notifyIcon.Icon = null;
         _notifyIcon.Dispose();
+        _trayIcon?.Dispose();
         _initialRefreshTimer.Dispose();
         _refreshTimer.Dispose();
         base.ExitThreadCore();

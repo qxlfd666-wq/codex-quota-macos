@@ -91,6 +91,23 @@ jobs:
             throw "Expected only CodexQuota.exe, found: $($files.Name -join ', ')"
           }
 
+          $bytes = [IO.File]::ReadAllBytes($files[0].FullName)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) {
+            throw ('Expected x64 PE machine 0x8664, found 0x{0:x4}' -f $machine)
+          }
+
+          $smoke = Start-Process `
+            -FilePath $files[0].FullName `
+            -ArgumentList '--self-test' `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+          if ($smoke.ExitCode -ne 0) {
+            throw "Published executable self-test failed with exit code $($smoke.ExitCode)"
+          }
+
       - name: Upload Windows build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
