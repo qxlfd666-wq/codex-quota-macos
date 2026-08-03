@@ -18,6 +18,7 @@ internal static partial class NativeMethods
     internal const uint SwpNoActivate = 0x0010;
     internal const uint SwpShowWindow = 0x0040;
     internal static readonly nint HwndTopmost = new(-1);
+    private static readonly IReadOnlySet<nint> NoExcludedWindows = new HashSet<nint>();
 
     private delegate bool EnumWindowsCallback(nint window, nint parameter);
 
@@ -152,7 +153,8 @@ internal static partial class NativeMethods
     internal static bool TryUpdateLayeredWindow(
         nint window,
         Bitmap bitmap,
-        Point destination)
+        Point destination,
+        byte sourceAlpha = byte.MaxValue)
     {
         if (window == 0 || bitmap.Width <= 0 || bitmap.Height <= 0)
             return false;
@@ -184,7 +186,7 @@ internal static partial class NativeMethods
             var blend = new NativeBlendFunction
             {
                 BlendOp = AcSrcOver,
-                SourceConstantAlpha = byte.MaxValue,
+                SourceConstantAlpha = sourceAlpha,
                 AlphaFormat = AcSrcAlpha
             };
             return UpdateLayeredWindowCore(
@@ -271,9 +273,25 @@ internal static partial class NativeMethods
 
     internal static bool TryActivateVisibleCodexWindow()
     {
+        return TryGetAnyVisibleCodexWindow(out var selected) &&
+               TryActivateCodexWindow(selected.Handle);
+    }
+
+    internal static bool TryGetAnyVisibleCodexWindow(out TrackedWindow mainWindow) =>
+        TryGetAnyVisibleCodexWindow(
+            excludedWindows: NoExcludedWindows,
+            out mainWindow);
+
+    internal static bool TryGetAnyVisibleCodexWindow(
+        IReadOnlySet<nint> excludedWindows,
+        out TrackedWindow mainWindow)
+    {
         TrackedWindow? selected = null;
         EnumWindowsCallback callback = (window, _) =>
         {
+            if (excludedWindows.Contains(window))
+                return true;
+
             if (!TryCreateCodexCandidate(window, out var candidate) ||
                 !CodexWindowRules.IsEligibleMainWindow(candidate.Bounds, candidate.Scale))
                 return true;
@@ -283,7 +301,24 @@ internal static partial class NativeMethods
         };
         _ = EnumWindows(callback, 0);
 
-        return selected is { } candidate && TryActivateCodexWindow(candidate.Handle);
+        if (selected is not { } selectedWindow)
+        {
+            mainWindow = default;
+            return false;
+        }
+
+        mainWindow = selectedWindow;
+        return true;
+    }
+
+    internal static bool IsWindowUnavailableForOverlay(nint window)
+    {
+        if (window == 0 || !IsWindow(window))
+            return false;
+
+        return !IsWindowVisible(window) ||
+               IsIconic(window) ||
+               IsWindowCloaked(window);
     }
 
     internal static bool TryActivateCodexWindow(nint window)
@@ -303,17 +338,35 @@ internal static partial class NativeMethods
         TryCreateCandidate(window, expectedProcessId, out candidate) &&
         CodexWindowRules.IsEligibleMainWindow(candidate.Bounds, candidate.Scale);
 
-    internal static bool IsForegroundWindowOrOwnedBy(nint window)
+    internal static bool TryGetVisibleTrackedCodexWindow(
+        nint window,
+        out TrackedWindow candidate) =>
+        TryCreateCodexCandidate(window, out candidate) &&
+        CodexWindowRules.IsEligibleMainWindow(candidate.Bounds, candidate.Scale);
+
+    internal static bool IsCodexWindow(nint window)
     {
-        if (window == 0)
+        if (window == 0 || !IsWindow(window))
             return false;
 
-        var foregroundWindow = GetForegroundWindow();
-        return foregroundWindow == window ||
-               (foregroundWindow != 0 && GetAncestor(foregroundWindow, GaRootOwner) == window);
+        GetWindowThreadProcessId(window, out var processId);
+        return IsSupportedCodexProcess(processId);
     }
 
-    internal static nint HookCodexWindowMoveEvents(
+    internal static bool IsEligibleCodexMainWindow(nint window)
+    {
+        if (!IsCodexWindow(window) ||
+            !TryGetWindowBounds(window, out var bounds))
+        {
+            return false;
+        }
+
+        return CodexWindowRules.IsEligibleMainWindow(
+            bounds,
+            GetWindowScale(window));
+    }
+
+    internal static nint HookCodexWindowEvents(
         uint eventMin,
         uint eventMax,
         WinEventCallback callback,
@@ -331,6 +384,17 @@ internal static partial class NativeMethods
     {
         candidate = default;
         if (window == 0)
+            return false;
+
+        var exists = IsWindow(window);
+        var isVisible = exists && IsWindowVisible(window);
+        var isMinimized = isVisible && IsIconic(window);
+        var isCloaked = isVisible && !isMinimized && IsWindowCloaked(window);
+        if (!CodexWindowRules.IsTrackableWindowState(
+                exists,
+                isVisible,
+                isMinimized,
+                isCloaked))
             return false;
 
         GetWindowThreadProcessId(window, out var processId);
@@ -363,7 +427,18 @@ internal static partial class NativeMethods
         out TrackedWindow candidate)
     {
         candidate = default;
-        if (window == 0 || !IsWindowVisible(window) || IsIconic(window) || IsWindowCloaked(window))
+        if (window == 0)
+            return false;
+
+        var exists = IsWindow(window);
+        var isVisible = exists && IsWindowVisible(window);
+        var isMinimized = isVisible && IsIconic(window);
+        var isCloaked = isVisible && !isMinimized && IsWindowCloaked(window);
+        if (!CodexWindowRules.IsTrackableWindowState(
+                exists,
+                isVisible,
+                isMinimized,
+                isCloaked))
             return false;
 
         GetWindowThreadProcessId(window, out var processId);

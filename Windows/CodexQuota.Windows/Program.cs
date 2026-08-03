@@ -66,7 +66,18 @@ internal static class Program
             if (!NativeMethods.TryUpdateLayeredWindow(
                     overlay.Handle,
                     preview,
-                    new Point(-32_000, -32_000)))
+                    new Point(-32_000, -32_000),
+                    sourceAlpha: byte.MinValue) ||
+                !NativeMethods.TryUpdateLayeredWindow(
+                    overlay.Handle,
+                    preview,
+                    new Point(-32_000, -32_000),
+                    sourceAlpha: 128) ||
+                !NativeMethods.TryUpdateLayeredWindow(
+                    overlay.Handle,
+                    preview,
+                    new Point(-32_000, -32_000),
+                    sourceAlpha: byte.MaxValue))
                 return 15;
 
             using var trayIcon = TrayIconRenderer.CreateForSystemTray(

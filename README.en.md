@@ -46,7 +46,7 @@ The [v1.2.0 cross-platform release](https://github.com/qxlfd666-wq/codex-quota/r
 - Places the remaining percentage and a slim progress bar beside Codex's existing avatar and account name.
 - Uses red by default; click the badge to choose any color and keep that choice between launches.
 - Tracks the Codex window as it moves, resizes, or changes display.
-- Appears only while Codex is in the foreground and hides when Codex is minimized or another app is active.
+- On Windows, stays visible while the Codex window is available and fades smoothly when Codex is minimized or restored; on macOS, appears only while Codex is in the foreground. It hides when Codex is closed.
 - Shows the remaining percentage in the macOS menu bar; the number inside the Windows tray icon is the remaining percentage.
 - Copies a share-ready quota card that excludes names, email addresses, plan names, and other account identifiers.
 - Refreshes every 60 seconds, with manual refresh from the macOS menu bar or Windows system tray.

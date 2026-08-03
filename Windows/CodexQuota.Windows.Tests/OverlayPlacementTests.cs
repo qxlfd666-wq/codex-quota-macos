@@ -9,13 +9,15 @@ public sealed class OverlayPlacementTests
     [Theory]
     [InlineData(0x000A, 101, 0, 0, 101, 900, (int)CodexWindowEventAction.BeginMove)]
     [InlineData(0x000B, 101, 0, 0, 101, 900, (int)CodexWindowEventAction.EndMove)]
+    [InlineData(0x0016, 101, 0, 0, 101, 900, (int)CodexWindowEventAction.BeginMinimize)]
+    [InlineData(0x0017, 101, 0, 0, 101, 900, (int)CodexWindowEventAction.EndMinimize)]
     [InlineData(0x800B, 101, 0, 0, 101, 900, (int)CodexWindowEventAction.Move)]
     [InlineData(0x800B, 101, -4, 0, 101, 900, (int)CodexWindowEventAction.Ignore)]
     [InlineData(0x800B, 101, 0, 1, 101, 900, (int)CodexWindowEventAction.Ignore)]
     [InlineData(0x800B, 202, 0, 0, 101, 900, (int)CodexWindowEventAction.Ignore)]
     [InlineData(0x800B, 900, 0, 0, 900, 900, (int)CodexWindowEventAction.Ignore)]
     [InlineData(0x800B, 101, 0, 0, 0, 900, (int)CodexWindowEventAction.Ignore)]
-    public void MovementEventsOnlyAffectTheCurrentTopLevelCodexWindow(
+    public void WindowEventsOnlyAffectTheCurrentTopLevelCodexWindow(
         uint eventType,
         long eventWindow,
         int objectId,
@@ -33,6 +35,51 @@ public sealed class OverlayPlacementTests
             (nint)overlayWindow);
 
         Assert.Equal((CodexWindowEventAction)expected, action);
+    }
+
+    [Fact]
+    public void MinimizeEndCanCompleteAPendingNonTrackedWindow()
+    {
+        var action = CodexWindowEventRules.Classify(
+            CodexWindowEventRules.EventSystemMinimizeEnd,
+            eventWindow: (nint)202,
+            objectId: 0,
+            childId: 0,
+            trackedWindow: (nint)101,
+            overlayWindow: (nint)900,
+            isKnownVisibilityWindow: true);
+
+        Assert.Equal(CodexWindowEventAction.EndMinimize, action);
+    }
+
+    [Fact]
+    public void MinimizeStartCanTrackAnotherKnownCodexWindow()
+    {
+        var action = CodexWindowEventRules.Classify(
+            CodexWindowEventRules.EventSystemMinimizeStart,
+            eventWindow: (nint)202,
+            objectId: 0,
+            childId: 0,
+            trackedWindow: (nint)101,
+            overlayWindow: (nint)900,
+            isKnownVisibilityWindow: true);
+
+        Assert.Equal(CodexWindowEventAction.BeginMinimize, action);
+    }
+
+    [Fact]
+    public void PendingWindowDoesNotReceiveUnrelatedMovementEvents()
+    {
+        var action = CodexWindowEventRules.Classify(
+            CodexWindowEventRules.EventObjectLocationChange,
+            eventWindow: (nint)202,
+            objectId: 0,
+            childId: 0,
+            trackedWindow: (nint)101,
+            overlayWindow: (nint)900,
+            isKnownVisibilityWindow: true);
+
+        Assert.Equal(CodexWindowEventAction.Ignore, action);
     }
 
     [Theory]

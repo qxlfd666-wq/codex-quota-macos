@@ -10,8 +10,12 @@ internal sealed class OverlayForm : Form
 {
     private const int NormalTrackingInterval = 200;
     private const int MovingTrackingInterval = 15;
+    private const int FadeFrameInterval = 15;
+    private const int VisibilityEventTrackingDuration = 600;
     private readonly System.Windows.Forms.Timer _trackingTimer;
+    private readonly System.Windows.Forms.Timer _fadeTimer;
     private readonly NativeMethods.WinEventCallback _winEventCallback;
+    private readonly Dictionary<nint, OverlayWindowTransition> _windowTransitions = new();
     private GCHandle _winEventCallbackHandle;
     private int? _remainingPercent;
     private Color _accentColor = Color.FromArgb(255, 59, 48);
@@ -22,8 +26,12 @@ internal sealed class OverlayForm : Form
     private uint _hookedCodexProcessId;
     private nint _moveSizeEventHook;
     private nint _locationChangeEventHook;
+    private nint _minimizeEventHook;
     private long _lastMovementEventTick;
     private long _nextHookRetryTick;
+    private long _visibilityTrackingUntilTick;
+    private OverlayFadeTransition? _fadeTransition;
+    private byte _overlayAlpha;
     private bool _hasLayeredContent;
     private bool _eventHooksEnabled;
     private bool _isMoveSizing;
@@ -48,11 +56,16 @@ internal sealed class OverlayForm : Form
         _winEventCallbackHandle = GCHandle.Alloc(_winEventCallback);
         _trackingTimer = new System.Windows.Forms.Timer { Interval = NormalTrackingInterval };
         _trackingTimer.Tick += (_, _) => HandleTrackingTimerTick();
+        _fadeTimer = new System.Windows.Forms.Timer { Interval = FadeFrameInterval };
+        _fadeTimer.Tick += (_, _) => HandleFadeTimerTick();
     }
 
     public event EventHandler? ChooseColorRequested;
 
     internal nint TrackedCodexWindow => _trackedCodexWindow;
+
+    private static OverlayAnimationTiming CurrentAnimationTiming =>
+        OverlayAnimationTiming.Coordinated;
 
     protected override bool ShowWithoutActivation => true;
 
@@ -126,9 +139,52 @@ internal sealed class OverlayForm : Form
 
     private void UpdatePlacement(bool animateLoading)
     {
-        if (!NativeMethods.TryGetCodexForegroundWindow(out var codexWindow))
+        var now = Environment.TickCount64;
+        var timing = CurrentAnimationTiming;
+        ReconcileWindowTransitions(now, timing);
+        ObserveTrackedWindowUnavailable(now);
+
+        var minimizingWindows = _windowTransitions
+            .Where(pair => pair.Value.Phase == OverlayWindowTransitionPhase.Minimizing)
+            .Select(pair => pair.Key)
+            .ToHashSet();
+        TrackedWindow? foregroundCodex = null;
+        TrackedWindow? trackedCodex = null;
+        TrackedWindow? otherVisibleCodex = null;
+        if (NativeMethods.TryGetCodexForegroundWindow(out var foregroundWindow) &&
+            !minimizingWindows.Contains(foregroundWindow.Handle))
         {
-            HideOverlay();
+            foregroundCodex = foregroundWindow;
+        }
+
+        if (foregroundCodex is null &&
+            _trackedCodexWindow != 0 &&
+            !minimizingWindows.Contains(_trackedCodexWindow) &&
+            NativeMethods.TryGetVisibleTrackedCodexWindow(
+                _trackedCodexWindow,
+                out var trackedWindow))
+        {
+            trackedCodex = trackedWindow;
+        }
+
+        if (foregroundCodex is null &&
+            trackedCodex is null &&
+            NativeMethods.TryGetAnyVisibleCodexWindow(
+                minimizingWindows,
+                out var visibleWindow))
+        {
+            otherVisibleCodex = visibleWindow;
+        }
+
+        var selectedWindow = OverlayWindowSelectionRules.Select(
+            foregroundCodex,
+            trackedCodex,
+            otherVisibleCodex);
+        if (selectedWindow is not { } codexWindow)
+        {
+            var clearTrackedWindow = _trackedCodexWindow == 0 ||
+                                     !NativeMethods.IsCodexWindow(_trackedCodexWindow);
+            HideOverlay(clearTrackedWindow);
             return;
         }
 
@@ -136,21 +192,41 @@ internal sealed class OverlayForm : Form
         if (_eventHooksEnabled)
             EnsureWindowEventHooks(codexWindow.Handle);
 
+        if (_windowTransitions.TryGetValue(codexWindow.Handle, out var transition) &&
+            transition.Phase == OverlayWindowTransitionPhase.Restoring)
+        {
+            if (!OverlayWindowTransitionRules.IsRestoreReady(
+                    transition,
+                    now,
+                    timing.RequiredStableSamples))
+            {
+                HideOverlay(clearTrackedWindow: false);
+                return;
+            }
+
+            _windowTransitions.Remove(codexWindow.Handle);
+        }
+
         ApplyPlacement(codexWindow, animateLoading);
     }
 
     private void ApplyPlacement(TrackedWindow codexWindow, bool animateLoading)
     {
-
         // Codex currently has no public API for its account-row coordinates.
         // These offsets follow the stable lower-left sidebar geometry.
         var badgeBounds = CodexWindowRules.BadgeBounds(codexWindow.Bounds, codexWindow.Scale);
+        var overlayWasVisible = NativeMethods.IsWindowVisible(Handle);
+        if (!overlayWasVisible)
+            _overlayAlpha = byte.MinValue;
+
         var placementAction = BadgePlacementRules.Decide(
             _lastBadgeBounds,
             badgeBounds,
             _hasLayeredContent,
             animateLoading,
             _displayState == OverlayDisplayState.Loading);
+        if (!overlayWasVisible && placementAction != BadgePlacementAction.RenderAndMove)
+            placementAction = BadgePlacementAction.RenderAndMove;
 
         if (placementAction == BadgePlacementAction.RenderAndMove)
         {
@@ -161,12 +237,13 @@ internal sealed class OverlayForm : Form
 
         if (!_hasLayeredContent)
         {
-            HideOverlay();
+            HideOverlay(clearTrackedWindow: false, animate: false);
             return;
         }
 
+        var overlayReady = overlayWasVisible;
         if (placementAction != BadgePlacementAction.None ||
-            !NativeMethods.IsWindowVisible(Handle))
+            !overlayWasVisible)
         {
             var positionApplied = NativeMethods.SetWindowPos(
                 Handle,
@@ -177,19 +254,37 @@ internal sealed class OverlayForm : Form
                 badgeBounds.Height,
                 NativeMethods.SwpNoActivate | NativeMethods.SwpShowWindow);
             if (positionApplied)
+            {
                 _lastBadgeBounds = badgeBounds;
+                overlayReady = true;
+            }
         }
+
+        if (!overlayReady)
+        {
+            HideOverlay(clearTrackedWindow: false, animate: false);
+            return;
+        }
+
+        FadeOverlayTo(byte.MaxValue);
     }
 
     private void HandleTrackingTimerTick()
     {
+        var now = Environment.TickCount64;
         if (_isMoveSizing &&
-            Environment.TickCount64 - _lastMovementEventTick > NormalTrackingInterval * 3L)
+            now - _lastMovementEventTick > NormalTrackingInterval * 3L)
         {
             // MOVESIZEEND can be lost if the target HWND is destroyed or the
             // desktop switches mid-drag. A quiet-period watchdog prevents the
             // 15 ms fallback timer from becoming permanent.
             StopFastTracking();
+        }
+
+        if (_visibilityTrackingUntilTick != 0 && now >= _visibilityTrackingUntilTick)
+        {
+            _visibilityTrackingUntilTick = 0;
+            UpdateTrackingTimerInterval();
         }
 
         if (_isMoveSizing && TryMoveTrackedOverlay())
@@ -202,9 +297,9 @@ internal sealed class OverlayForm : Form
     {
         var trackedWindow = _trackedCodexWindow;
         if (trackedWindow == 0 ||
+            _windowTransitions.ContainsKey(trackedWindow) ||
             !_hasLayeredContent ||
             _lastBadgeBounds.IsEmpty ||
-            !NativeMethods.IsForegroundWindowOrOwnedBy(trackedWindow) ||
             !NativeMethods.TryGetTrackedCodexWindow(
                 trackedWindow,
                 _hookedCodexProcessId,
@@ -247,10 +342,20 @@ internal sealed class OverlayForm : Form
 
         if (_hookedCodexWindow == codexWindow && _hookedCodexProcessId == processId)
         {
-            if (_moveSizeEventHook != 0 && _locationChangeEventHook != 0)
+            var movementHooksReady =
+                _moveSizeEventHook != 0 && _locationChangeEventHook != 0;
+            if (movementHooksReady && _minimizeEventHook != 0)
                 return;
             if (Environment.TickCount64 < _nextHookRetryTick)
                 return;
+
+            // A failed minimize hook must not tear down the working movement
+            // hooks and reintroduce visible drag lag.
+            if (movementHooksReady)
+            {
+                InstallMinimizeEventHook(processId);
+                return;
+            }
         }
 
         StopFastTracking();
@@ -258,13 +363,13 @@ internal sealed class OverlayForm : Form
         _hookedCodexWindow = codexWindow;
         _hookedCodexProcessId = processId;
 
-        var moveSizeHook = NativeMethods.HookCodexWindowMoveEvents(
+        var moveSizeHook = NativeMethods.HookCodexWindowEvents(
             CodexWindowEventRules.EventSystemMoveSizeStart,
             CodexWindowEventRules.EventSystemMoveSizeEnd,
             _winEventCallback,
             processId);
         var moveSizeError = moveSizeHook == 0 ? Marshal.GetLastWin32Error() : 0;
-        var locationChangeHook = NativeMethods.HookCodexWindowMoveEvents(
+        var locationChangeHook = NativeMethods.HookCodexWindowEvents(
             CodexWindowEventRules.EventObjectLocationChange,
             CodexWindowEventRules.EventObjectLocationChange,
             _winEventCallback,
@@ -287,6 +392,27 @@ internal sealed class OverlayForm : Form
 
         _moveSizeEventHook = moveSizeHook;
         _locationChangeEventHook = locationChangeHook;
+        _nextHookRetryTick = 0;
+        InstallMinimizeEventHook(processId);
+    }
+
+    private void InstallMinimizeEventHook(uint processId)
+    {
+        var minimizeHook = NativeMethods.HookCodexWindowEvents(
+            CodexWindowEventRules.EventSystemMinimizeStart,
+            CodexWindowEventRules.EventSystemMinimizeEnd,
+            _winEventCallback,
+            processId);
+        if (minimizeHook == 0)
+        {
+            Debug.WriteLine(
+                "Unable to install the Codex minimize hook; placement polling fallback remains active. " +
+                $"Win32 error: {Marshal.GetLastWin32Error()}");
+            _nextHookRetryTick = Environment.TickCount64 + 5_000;
+            return;
+        }
+
+        _minimizeEventHook = minimizeHook;
         _nextHookRetryTick = 0;
     }
 
@@ -317,13 +443,21 @@ internal sealed class OverlayForm : Form
                 return;
             }
 
+            var isVisibilityEvent =
+                eventType is CodexWindowEventRules.EventSystemMinimizeStart or
+                    CodexWindowEventRules.EventSystemMinimizeEnd;
+            var isKnownVisibilityWindow =
+                _windowTransitions.ContainsKey(eventWindow) ||
+                (isVisibilityEvent &&
+                 NativeMethods.IsEligibleCodexMainWindow(eventWindow));
             var action = CodexWindowEventRules.Classify(
                 eventType,
                 eventWindow,
                 objectId,
                 childId,
                 _trackedCodexWindow,
-                Handle);
+                Handle,
+                isKnownVisibilityWindow);
             if (action == CodexWindowEventAction.Ignore)
                 return;
 
@@ -337,7 +471,14 @@ internal sealed class OverlayForm : Form
                     StartFastTracking();
                 else if (action == CodexWindowEventAction.EndMove)
                     StopFastTracking();
-                QueuePlacementUpdate(action == CodexWindowEventAction.EndMove);
+                else if (action == CodexWindowEventAction.BeginMinimize)
+                    BeginMinimizeTransition(eventWindow);
+                else if (action == CodexWindowEventAction.EndMinimize)
+                    BeginRestoreTransition(eventWindow);
+                QueuePlacementUpdate(
+                    action is CodexWindowEventAction.EndMove or
+                    CodexWindowEventAction.BeginMinimize or
+                    CodexWindowEventAction.EndMinimize);
                 return;
             }
 
@@ -362,6 +503,16 @@ internal sealed class OverlayForm : Form
                         StopFastTracking();
                         QueuePlacementUpdate(fullUpdate: true);
                         break;
+
+                    case CodexWindowEventAction.BeginMinimize:
+                        BeginMinimizeTransition(eventWindow);
+                        QueuePlacementUpdate(fullUpdate: true);
+                        break;
+
+                    case CodexWindowEventAction.EndMinimize:
+                        BeginRestoreTransition(eventWindow);
+                        QueuePlacementUpdate(fullUpdate: true);
+                        break;
                 }
             }
             finally
@@ -372,7 +523,7 @@ internal sealed class OverlayForm : Form
         catch (Exception exception)
         {
             // Exceptions must never cross the native WinEvent callback boundary.
-            Debug.WriteLine($"Unable to process a Codex movement event: {exception}");
+            Debug.WriteLine($"Unable to process a Codex window event: {exception}");
             QueuePlacementUpdate(fullUpdate: true);
         }
     }
@@ -381,15 +532,139 @@ internal sealed class OverlayForm : Form
     {
         _lastMovementEventTick = Environment.TickCount64;
         _isMoveSizing = true;
-        if (_trackingTimer.Interval != MovingTrackingInterval)
-            _trackingTimer.Interval = MovingTrackingInterval;
+        UpdateTrackingTimerInterval();
     }
 
     private void StopFastTracking()
     {
         _isMoveSizing = false;
-        if (!_disposed && _trackingTimer.Interval != NormalTrackingInterval)
-            _trackingTimer.Interval = NormalTrackingInterval;
+        UpdateTrackingTimerInterval();
+    }
+
+    private void StartVisibilityEventTracking()
+    {
+        _visibilityTrackingUntilTick =
+            Environment.TickCount64 + VisibilityEventTrackingDuration;
+        UpdateTrackingTimerInterval();
+    }
+
+    private void BeginMinimizeTransition(nint codexWindow)
+    {
+        if (codexWindow == 0)
+            return;
+
+        _windowTransitions[codexWindow] =
+            OverlayWindowTransitionRules.BeginMinimize(Environment.TickCount64);
+        StartVisibilityEventTracking();
+    }
+
+    private void BeginRestoreTransition(nint codexWindow)
+    {
+        if (codexWindow == 0)
+            return;
+
+        var timing = CurrentAnimationTiming;
+        _windowTransitions[codexWindow] =
+            OverlayWindowTransitionRules.BeginRestore(
+                Environment.TickCount64,
+                timing.RestoreRevealDelayMilliseconds);
+        StartVisibilityEventTracking();
+    }
+
+    private void ObserveTrackedWindowUnavailable(long now)
+    {
+        var trackedWindow = _trackedCodexWindow;
+        if (trackedWindow == 0 ||
+            _windowTransitions.ContainsKey(trackedWindow) ||
+            !NativeMethods.IsCodexWindow(trackedWindow) ||
+            !NativeMethods.IsWindowUnavailableForOverlay(trackedWindow))
+        {
+            return;
+        }
+
+        _windowTransitions[trackedWindow] =
+            OverlayWindowTransitionRules.BeginMinimize(
+                now,
+                observedUnavailable: true);
+        StartVisibilityEventTracking();
+    }
+
+    private void ReconcileWindowTransitions(
+        long now,
+        OverlayAnimationTiming timing)
+    {
+        foreach (var pair in _windowTransitions.ToArray())
+        {
+            var window = pair.Key;
+            if (!NativeMethods.IsCodexWindow(window))
+            {
+                _windowTransitions.Remove(window);
+                continue;
+            }
+
+            var isAvailable = NativeMethods.TryGetVisibleTrackedCodexWindow(
+                window,
+                out var candidate);
+            var transition = pair.Value;
+            OverlayWindowTransition updated;
+            if (transition.Phase == OverlayWindowTransitionPhase.Minimizing)
+            {
+                updated = OverlayWindowTransitionRules.ObserveMinimizeState(
+                    transition,
+                    isAvailable,
+                    now,
+                    timing.MinimizeRecoveryGraceMilliseconds,
+                    timing.RestoreRevealDelayMilliseconds);
+            }
+            else if (isAvailable)
+            {
+                updated = OverlayWindowTransitionRules.ObserveRestorePlacement(
+                    transition,
+                    candidate);
+                if (OverlayWindowTransitionRules.IsRestoreReady(
+                        updated,
+                        now,
+                        timing.RequiredStableSamples))
+                {
+                    _windowTransitions.Remove(window);
+                    continue;
+                }
+            }
+            else if (OverlayWindowTransitionRules.ShouldRestartMinimizeAfterRestore(
+                         transition,
+                         NativeMethods.IsWindowUnavailableForOverlay(window),
+                         now,
+                         VisibilityEventTrackingDuration))
+            {
+                updated = OverlayWindowTransitionRules.BeginMinimize(
+                    now,
+                    observedUnavailable: true);
+            }
+            else
+            {
+                continue;
+            }
+
+            _windowTransitions[window] = updated;
+            if (updated.Phase == OverlayWindowTransitionPhase.Restoring &&
+                transition.Phase != OverlayWindowTransitionPhase.Restoring)
+            {
+                StartVisibilityEventTracking();
+            }
+        }
+    }
+
+    private void UpdateTrackingTimerInterval()
+    {
+        if (_disposed)
+            return;
+
+        var useFastInterval = _isMoveSizing ||
+                              (_visibilityTrackingUntilTick != 0 &&
+                               Environment.TickCount64 < _visibilityTrackingUntilTick);
+        var interval = useFastInterval ? MovingTrackingInterval : NormalTrackingInterval;
+        if (_trackingTimer.Interval != interval)
+            _trackingTimer.Interval = interval;
     }
 
     private void QueuePlacementUpdate(bool fullUpdate)
@@ -431,9 +706,12 @@ internal sealed class OverlayForm : Form
             _ = NativeMethods.UnhookWinEvent(_moveSizeEventHook);
         if (_locationChangeEventHook != 0)
             _ = NativeMethods.UnhookWinEvent(_locationChangeEventHook);
+        if (_minimizeEventHook != 0)
+            _ = NativeMethods.UnhookWinEvent(_minimizeEventHook);
 
         _moveSizeEventHook = 0;
         _locationChangeEventHook = 0;
+        _minimizeEventHook = 0;
         _hookedCodexWindow = 0;
         _hookedCodexProcessId = 0;
         _nextHookRetryTick = 0;
@@ -446,7 +724,7 @@ internal sealed class OverlayForm : Form
 
         _hasLayeredContent = DrawLayeredBadge(_lastBadgeBounds);
         if (!_hasLayeredContent)
-            HideOverlay();
+            HideOverlay(clearTrackedWindow: false, animate: false);
     }
 
     private bool DrawLayeredBadge(Rectangle badgeBounds)
@@ -462,7 +740,8 @@ internal sealed class OverlayForm : Form
             return NativeMethods.TryUpdateLayeredWindow(
                 Handle,
                 bitmap,
-                badgeBounds.Location);
+                badgeBounds.Location,
+                _overlayAlpha);
         }
         catch (Exception exception)
         {
@@ -482,15 +761,127 @@ internal sealed class OverlayForm : Form
         catch (Exception exception)
         {
             Debug.WriteLine($"Unable to track the Codex window: {exception}");
-            HideOverlay();
+            HideOverlay(clearTrackedWindow: false, animate: false);
         }
     }
 
-    private void HideOverlay()
+    private void FadeOverlayTo(byte targetAlpha)
+    {
+        var now = Environment.TickCount64;
+        var timing = CurrentAnimationTiming;
+        var duration = targetAlpha == byte.MinValue
+            ? timing.FadeOutMilliseconds
+            : timing.FadeInMilliseconds;
+        var curve = targetAlpha == byte.MinValue
+            ? OverlayFadeCurve.FastOut
+            : OverlayFadeCurve.SmoothStep;
+        OverlayFadeTransition transition;
+        if (_fadeTransition is { } currentTransition)
+        {
+            if (currentTransition.TargetAlpha == targetAlpha)
+                return;
+
+            // Reverse from the last alpha that was successfully drawn. Sampling
+            // between frames can otherwise create a small visible jump.
+            transition = OverlayFadeRules.Retarget(
+                currentTransition,
+                _overlayAlpha,
+                targetAlpha,
+                now,
+                duration,
+                curve);
+        }
+        else
+        {
+            transition = OverlayFadeRules.Start(
+                _overlayAlpha,
+                targetAlpha,
+                now,
+                duration,
+                curve);
+        }
+
+        if (transition.DurationMilliseconds <= 0)
+        {
+            StopFadeAnimation();
+            _overlayAlpha = targetAlpha;
+            if (targetAlpha == byte.MinValue)
+            {
+                CompleteOverlayHide();
+            }
+            else if (_hasLayeredContent &&
+                     !_lastBadgeBounds.IsEmpty &&
+                     !DrawLayeredBadge(_lastBadgeBounds))
+            {
+                HideOverlay(clearTrackedWindow: false, animate: false);
+            }
+            return;
+        }
+
+        _fadeTransition = transition;
+        _fadeTimer.Start();
+    }
+
+    private void HandleFadeTimerTick()
+    {
+        if (_fadeTransition is not { } transition)
+        {
+            _fadeTimer.Stop();
+            return;
+        }
+
+        var sample = OverlayFadeRules.Sample(transition, Environment.TickCount64);
+        _overlayAlpha = sample.Alpha;
+        if (!_hasLayeredContent ||
+            _lastBadgeBounds.IsEmpty ||
+            !DrawLayeredBadge(_lastBadgeBounds))
+        {
+            HideOverlay(clearTrackedWindow: false, animate: false);
+            return;
+        }
+
+        if (!sample.IsComplete)
+            return;
+
+        _fadeTimer.Stop();
+        _fadeTransition = null;
+        if (transition.TargetAlpha == byte.MinValue)
+            CompleteOverlayHide();
+    }
+
+    private void StopFadeAnimation()
+    {
+        _fadeTimer.Stop();
+        _fadeTransition = null;
+    }
+
+    private void HideOverlay(bool clearTrackedWindow, bool animate = true)
     {
         StopFastTracking();
+        if (clearTrackedWindow)
+        {
+            _trackedCodexWindow = 0;
+            StopWindowEventHooks();
+        }
+
+        if (animate &&
+            IsHandleCreated &&
+            NativeMethods.IsWindowVisible(Handle) &&
+            _hasLayeredContent &&
+            !_lastBadgeBounds.IsEmpty)
+        {
+            FadeOverlayTo(byte.MinValue);
+            return;
+        }
+
+        CompleteOverlayHide();
+    }
+
+    private void CompleteOverlayHide()
+    {
+        StopFadeAnimation();
+        _overlayAlpha = byte.MinValue;
         _lastBadgeBounds = Rectangle.Empty;
-        _trackedCodexWindow = 0;
         _hasLayeredContent = false;
         if (IsHandleCreated && NativeMethods.IsWindowVisible(Handle))
             NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
@@ -502,10 +893,13 @@ internal sealed class OverlayForm : Form
         {
             _disposed = true;
             _trackingTimer.Stop();
+            _fadeTimer.Stop();
+            _windowTransitions.Clear();
             StopWindowEventHooks();
             if (_winEventCallbackHandle.IsAllocated)
                 _winEventCallbackHandle.Free();
             _trackingTimer.Dispose();
+            _fadeTimer.Dispose();
         }
         base.Dispose(disposing);
     }
